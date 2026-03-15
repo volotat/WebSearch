@@ -1,0 +1,2 @@
+markitdown
+beautifulsoup4
