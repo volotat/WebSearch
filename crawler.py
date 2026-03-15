@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 
 from markitdown import MarkItDown
 
-import pages.WebSearch.db_models as db_models
+import modules.WebSearch.db_models as db_models
 
 
 # ---------------------------------------------------------------------------

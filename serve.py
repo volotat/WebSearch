@@ -16,11 +16,11 @@ from omegaconf import OmegaConf
 
 import numpy as np
 
-import pages.WebSearch.db_models as db_models
-from pages.WebSearch.crawler import SiteCrawler
+import modules.WebSearch.db_models as db_models
+from modules.WebSearch.crawler import SiteCrawler
 from src.socket_events import CommonSocketEvents
 from src.text_embedder import TextEmbedder
-from pages.train.universal_train import UniversalEvaluator
+from modules.train.universal_train import UniversalEvaluator
 
 # ── Event catalogue ──────────────────────────────────────────────────────
 #

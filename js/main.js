@@ -1,6 +1,6 @@
-import StarRatingComponent from '/pages/StarRating.js';
-import FolderViewComponent from '/pages/FolderViewComponent.js';
-import ContextMenuComponent from '/pages/ContextMenuComponent.js';
+import StarRatingComponent from '/modules/StarRating.js';
+import FolderViewComponent from '/modules/FolderViewComponent.js';
+import ContextMenuComponent from '/modules/ContextMenuComponent.js';
 
 // ── State ────────────────────────────────────────────────────────────────
 let currentPage = 1;

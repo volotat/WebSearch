@@ -28,7 +28,7 @@ def get_training_pairs(cfg, text_embedder, status_callback=None):
     ------
     (np.ndarray of shape [chunks, dim], float)
     """
-    import pages.WebSearch.db_models as db_models
+    import modules.WebSearch.db_models as db_models
 
     storage_dir = OmegaConf.select(
         cfg, "WebSearch.storage_directory",
