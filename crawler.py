@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 
 from markitdown import MarkItDown
 
-import pages.web_search.db_models as db_models
+import pages.WebSearch.db_models as db_models
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ class SiteCrawler:
     ----------
     storage_dir : str
         Root directory where .md files are written
-        (e.g. ``/mnt/project_config/modules/web_search``).
+        (e.g. ``/mnt/project_config/modules/WebSearch``).
     crawl_delay : float
         Seconds to wait between HTTP requests (default 1.0).
     max_pages : int
@@ -207,7 +207,7 @@ class SiteCrawler:
             try:
                 page_info = self._fetch_and_store(url, domain, app, recrawl=recrawl)
             except Exception as exc:
-                print(f"[web_search] Error crawling {url}: {exc}")
+                print(f"[WebSearch] Error crawling {url}: {exc}")
                 continue
 
             if page_info is not None:

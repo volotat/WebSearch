@@ -1,9 +1,9 @@
-# Default configuration for the web_search module.
+# Default configuration for the WebSearch module.
 # These values are auto-merged into the main config at startup.
-# Override any of them by adding a `web_search:` section to root config.yaml.
+# Override any of them by adding a `WebSearch:` section to root config.yaml.
 
-web_search:
+WebSearch:
   name: WebSearch
-  storage_directory: /mnt/project_config/modules/web_search
+  storage_directory: /mnt/project_config/modules/WebSearch
   crawl_delay: 0.5          # seconds between HTTP requests
   max_pages_per_site: 300    # BFS page limit per domain

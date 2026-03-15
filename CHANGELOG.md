@@ -9,17 +9,17 @@
     *   Document Support: PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX linked from crawled pages are now fetched and converted to Markdown via markitdown. The correct temp-file extension is derived from the URL path first, then from the `Content-Type` header (`_DOCUMENT_MIME_TO_EXT` / `_temp_ext_for()`), ensuring markitdown selects the right converter. Documents produce no BFS links and have an empty title (URL shown as fallback in the UI). The rest of the pipeline - scoring, training, storage - is unchanged.
     *   Document Support: `_fetch_and_store` refactored to branch on `is_html`: HTML path is unchanged; non-HTML resources are accepted only if they resolve to a supported document extension, otherwise dropped silently.
 *   **Backend**
-    *   Per-Request Crawl Settings: `emit_web_search_crawl_site` now accepts `crawl_delay`, `max_pages`, and `sublinks_only` fields from the client. A fresh `SiteCrawler` instance is created per crawl request so custom delays and page limits do not affect concurrent crawls.
-    *   Recrawl socket event: New `emit_web_search_recrawl_site` handler (`{url, max_pages?, crawl_delay?, sublinks_only?}`). Runs `crawl_site(..., recrawl=True)` in a background thread; only changed/new pages are passed to the scorer.
+    *   Per-Request Crawl Settings: `emit_WebSearch_crawl_site` now accepts `crawl_delay`, `max_pages`, and `sublinks_only` fields from the client. A fresh `SiteCrawler` instance is created per crawl request so custom delays and page limits do not affect concurrent crawls.
+    *   Recrawl socket event: New `emit_WebSearch_recrawl_site` handler (`{url, max_pages?, crawl_delay?, sublinks_only?}`). Runs `crawl_site(..., recrawl=True)` in a background thread; only changed/new pages are passed to the scorer.
     *   Background Scoring: `_bulk_score_unscored()` is now launched in a background daemon thread at startup instead of running synchronously, so the module becomes available immediately while scoring progresses in the status bar.
-    *   Background Scoring: Added `_maybe_trigger_rescore()`, called on every `emit_web_search_get_pages` request. It compares `evaluator.hash` against the hash used in the last completed bulk-score run and starts a new background scoring thread if they differ - pages are automatically re-scored after retraining the universal evaluator without requiring a container restart.
+    *   Background Scoring: Added `_maybe_trigger_rescore()`, called on every `emit_WebSearch_get_pages` request. It compares `evaluator.hash` against the hash used in the last completed bulk-score run and starts a new background scoring thread if they differ - pages are automatically re-scored after retraining the universal evaluator without requiring a container restart.
     *   Background Scoring: Added `_scoring_state` dict (`last_hash`, `in_progress`) to track scoring thread lifecycle and prevent concurrent duplicate runs.
 *   **Frontend**
     *   Recrawl context menu + modal: Right-clicking a domain in the sidebar opens a context menu (`ContextMenuComponent`) with a "↻ Recrawl site" option.
     *   Recrawl context menu + modal: Selecting it opens a dedicated `#ws_recrawl_modal` with: editable seed URL (pre-filled from the domain), sublinks-only checkbox, crawl delay input, max pages input; Confirm/Cancel buttons.
     *   Add Page Modal: Replaced the URL text-input / `+` button / "Crawl Site" button in the sidebar with a single `+ Add page` button that opens a dedicated modal.
     *   Add Page Modal: Modal contains: a URL input field; an optional `StarRatingComponent` so the user can rate the page at add time; a "Start crawling website from this page" checkbox; a "Crawl only sublinks" checkbox (disabled until crawling is enabled) that restricts BFS to pages whose URL path starts with the seed URL's path (e.g. a specific subreddit); a configurable crawl-delay number input (disabled until crawling is enabled, default 0.5 s, with a hint to use ≥ 3 s for rate-limited sites like Reddit); a "Max pages to crawl" number input (disabled until crawling is enabled, default 5000); Confirm and Cancel buttons.
-    *   Add Page Modal: An optional user rating supplied in the modal is persisted immediately after the page is fetched (`emit_web_search_add_page`) or applied to the seed URL after a crawl completes (`emit_web_search_crawl_site`).
+    *   Add Page Modal: An optional user rating supplied in the modal is persisted immediately after the page is fetched (`emit_WebSearch_add_page`) or applied to the seed URL after a crawl completes (`emit_WebSearch_crawl_site`).
     
 ### Version 0.1.0 (10.03.2026)
 Initial implementation.
@@ -35,13 +35,13 @@ Initial implementation.
     *   `domain` is stored directly on `WebPage`; there is no separate `WebSite` table - per-domain statistics are computed live with a `GROUP BY domain` query, so counts are always exact regardless of how a page was added.
     *   Alembic migration `a3f8c12d9e01` creates the table; removes the earlier `WebSite` table and adds `domain` directly to `WebPage`.
 *   **Backend (`serve.py`):**
-    *   `emit_web_search_add_page` - crawls a single URL in a background thread, scores it, emits `emit_web_search_page_added`.
-    *   `emit_web_search_crawl_site` - BFS-crawls a domain in a background thread, batch-scores all new pages, emits updated sites list when done.
-    *   `emit_web_search_get_sites` - returns live per-domain stats (`domain`, `pages`, `last_crawl_date`, `crawl_status`) via `GROUP BY`; in-memory `_crawl_status_map` tracks actively crawling domains.
-    *   `emit_web_search_get_pages` - paginated, filterable by `domain` and `path` (md_file_path prefix), sortable by `rating` / `recent` / `alpha`; pages with no rating are excluded from results.
-    *   `emit_web_search_get_folders` - builds a `FolderViewComponent`-compatible folder tree dict from rated pages' `md_file_path` values, scoped to a single domain.
-    *   `emit_web_search_set_rating` - persists a user rating and returns the updated page dict.
-    *   `emit_web_search_get_page_content` - reads and returns the stored `.md` file content.
+    *   `emit_WebSearch_add_page` - crawls a single URL in a background thread, scores it, emits `emit_WebSearch_page_added`.
+    *   `emit_WebSearch_crawl_site` - BFS-crawls a domain in a background thread, batch-scores all new pages, emits updated sites list when done.
+    *   `emit_WebSearch_get_sites` - returns live per-domain stats (`domain`, `pages`, `last_crawl_date`, `crawl_status`) via `GROUP BY`; in-memory `_crawl_status_map` tracks actively crawling domains.
+    *   `emit_WebSearch_get_pages` - paginated, filterable by `domain` and `path` (md_file_path prefix), sortable by `rating` / `recent` / `alpha`; pages with no rating are excluded from results.
+    *   `emit_WebSearch_get_folders` - builds a `FolderViewComponent`-compatible folder tree dict from rated pages' `md_file_path` values, scoped to a single domain.
+    *   `emit_WebSearch_set_rating` - persists a user rating and returns the updated page dict.
+    *   `emit_WebSearch_get_page_content` - reads and returns the stored `.md` file content.
     *   Automatic bulk scoring at startup via `_bulk_score_unscored()`.
 *   **Scoring:**
     *   Uses the shared `TextEmbedder` + `UniversalEvaluator` (same model as all other modules).
@@ -56,5 +56,5 @@ Initial implementation.
     *   Page content viewed in a modal with rendered Markdown (`marked.js` + `DOMPurify`); the modal includes a star rating widget.
     *   Order buttons: By Rating (default) / Most Recent / Alphabetical. Pagination with ellipsis for large result sets.
 *   **Module Self-Containment:**
-    *   `pages/web_search/requirements.txt` - `markitdown`, `beautifulsoup4`.
-    *   `pages/web_search/config.defaults.yaml` - `storage_directory`, `crawl_delay`, `max_pages_per_site` with sensible defaults.
+    *   `pages/WebSearch/requirements.txt` - `markitdown`, `beautifulsoup4`.
+    *   `pages/WebSearch/config.defaults.yaml` - `storage_directory`, `crawl_delay`, `max_pages_per_site` with sensible defaults.

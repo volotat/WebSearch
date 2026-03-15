@@ -76,7 +76,7 @@ function buildCard(page) {
   const starRating = new StarRatingComponent({
     initialRating: displayRating,
     callback: (rating) => {
-      socket.emit('emit_web_search_set_rating', {
+      socket.emit('emit_WebSearch_set_rating', {
         page_id: page.id,
         rating: rating,
       }, (resp) => {
@@ -145,7 +145,7 @@ function fetchPages() {
   if (currentDomain) payload.domain = currentDomain;
   if (currentPath) payload.path = currentPath;
 
-  socket.emit('emit_web_search_get_pages', payload, (response) => {
+  socket.emit('emit_WebSearch_get_pages', payload, (response) => {
     const container = document.getElementById('ws_pages_container');
     container.innerHTML = '';
 
@@ -162,7 +162,7 @@ function fetchPages() {
 }
 
 function fetchSites() {
-  socket.emit('emit_web_search_get_sites', {}, (sites) => {
+  socket.emit('emit_WebSearch_get_sites', {}, (sites) => {
     const list = document.getElementById('ws_sites_list');
 
     // Keep the "All Sites" entry
@@ -229,7 +229,7 @@ function fetchFolders() {
 
   const payload = { domain: currentDomain };
 
-  socket.emit('emit_web_search_get_folders', payload, (foldersDict) => {
+  socket.emit('emit_WebSearch_get_folders', payload, (foldersDict) => {
     treeContainer.innerHTML = '';
 
     if (!foldersDict || foldersDict.total_files === 0) return;
@@ -273,7 +273,7 @@ function openPageModal(page) {
   const modalStarRating = new StarRatingComponent({
     initialRating: displayRating,
     callback: (rating) => {
-      socket.emit('emit_web_search_set_rating', {
+      socket.emit('emit_WebSearch_set_rating', {
         page_id: page.id,
         rating: rating,
       }, (resp) => {
@@ -297,7 +297,7 @@ function openPageModal(page) {
   modal.classList.add('is-active');
 
   // Fetch markdown content
-  socket.emit('emit_web_search_get_page_content', { page_id: page.id }, (resp) => {
+  socket.emit('emit_WebSearch_get_page_content', { page_id: page.id }, (resp) => {
     if (resp && resp.content) {
       marked.setOptions({ breaks: true, gfm: true });
       const html = DOMPurify.sanitize(marked.parse(resp.content));
@@ -333,7 +333,7 @@ function confirmRecrawlModal() {
   const crawlDelay = parseFloat(document.getElementById('ws_recrawl_delay_input').value) || 0.5;
   const maxPages = parseInt(document.getElementById('ws_recrawl_max_pages_input').value, 10) || 5000;
   closeRecrawlModal();
-  socket.emit('emit_web_search_recrawl_site', {
+  socket.emit('emit_WebSearch_recrawl_site', {
     url,
     sublinks_only: sublinksOnly,
     crawl_delay: crawlDelay,
@@ -399,11 +399,11 @@ function confirmAddModal() {
   if (shouldCrawl) {
     const payload = { url, sublinks_only: sublinksOnly, crawl_delay: crawlDelay, max_pages: maxPages };
     if (rating !== null) payload.seed_user_rating = rating;
-    socket.emit('emit_web_search_crawl_site', payload);
+    socket.emit('emit_WebSearch_crawl_site', payload);
   } else {
     const payload = { url };
     if (rating !== null) payload.user_rating = rating;
-    socket.emit('emit_web_search_add_page', payload);
+    socket.emit('emit_WebSearch_add_page', payload);
   }
 }
 
@@ -469,17 +469,17 @@ $(document).ready(function () {
   });
 
   // ── Live events from server ───────────────────────────────────────
-  socket.on('emit_web_search_page_added', (_page) => {
+  socket.on('emit_WebSearch_page_added', (_page) => {
     fetchSites();
     fetchFolders();
     fetchPages();
   });
 
-  socket.on('emit_web_search_crawl_progress', (data) => {
+  socket.on('emit_WebSearch_crawl_progress', (data) => {
     document.getElementById('ws_crawl_status').textContent = data.message || '';
   });
 
-  socket.on('emit_web_search_show_sites', (_sites) => {
+  socket.on('emit_WebSearch_show_sites', (_sites) => {
     fetchSites();
     fetchFolders();
     fetchPages();

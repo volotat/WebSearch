@@ -16,8 +16,8 @@ from omegaconf import OmegaConf
 
 import numpy as np
 
-import pages.web_search.db_models as db_models
-from pages.web_search.crawler import SiteCrawler
+import pages.WebSearch.db_models as db_models
+from pages.WebSearch.crawler import SiteCrawler
 from src.socket_events import CommonSocketEvents
 from src.text_embedder import TextEmbedder
 from pages.train.universal_train import UniversalEvaluator
@@ -25,52 +25,52 @@ from pages.train.universal_train import UniversalEvaluator
 # ── Event catalogue ──────────────────────────────────────────────────────
 #
 # Incoming (client → server):
-#   emit_web_search_add_page          {url}
-#   emit_web_search_crawl_site        {url, max_pages?}
-#   emit_web_search_get_sites
-#   emit_web_search_get_pages         {page, limit, domain?, text_query?, order?}
-#   emit_web_search_set_rating        {page_id, rating}
-#   emit_web_search_get_page_content  {page_id}
+#   emit_WebSearch_add_page          {url}
+#   emit_WebSearch_crawl_site        {url, max_pages?}
+#   emit_WebSearch_get_sites
+#   emit_WebSearch_get_pages         {page, limit, domain?, text_query?, order?}
+#   emit_WebSearch_set_rating        {page_id, rating}
+#   emit_WebSearch_get_page_content  {page_id}
 #
 # Outgoing (server → client):
-#   emit_web_search_show_sites        [{domain, pages, last_crawl_date}, …]
-#   emit_web_search_show_pages        {pages: [], total: int, page: int}
-#   emit_web_search_page_added        {page dict}
-#   emit_web_search_crawl_progress    {message}
-#   emit_web_search_show_page_content {page_id, content}
+#   emit_WebSearch_show_sites        [{domain, pages, last_crawl_date}, …]
+#   emit_WebSearch_show_pages        {pages: [], total: int, page: int}
+#   emit_WebSearch_page_added        {page dict}
+#   emit_WebSearch_crawl_progress    {message}
+#   emit_WebSearch_show_page_content {page_id, content}
 #   emit_show_search_status           (via CommonSocketEvents)
 # ─────────────────────────────────────────────────────────────────────────
 
 
 def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_folder='./project_data'):
-    common_socket_events = CommonSocketEvents(socketio, module_name="web_search")
+    common_socket_events = CommonSocketEvents(socketio, module_name="WebSearch")
 
     # ── Storage directory ────────────────────────────────────────────────
-    storage_dir = OmegaConf.select(cfg, "web_search.storage_directory",
-                                   default="/mnt/project_config/modules/web_search")
+    storage_dir = OmegaConf.select(cfg, "WebSearch.storage_directory",
+                                   default="/mnt/project_config/modules/WebSearch")
     os.makedirs(storage_dir, exist_ok=True)
 
     # ── Crawler settings ─────────────────────────────────────────────────
-    crawl_delay = OmegaConf.select(cfg, "web_search.crawl_delay", default=1.0)
-    max_pages_per_site = OmegaConf.select(cfg, "web_search.max_pages_per_site", default=50)
+    crawl_delay = OmegaConf.select(cfg, "WebSearch.crawl_delay", default=1.0)
+    max_pages_per_site = OmegaConf.select(cfg, "WebSearch.max_pages_per_site", default=50)
 
     # ── Text embedder (for scoring) ─────────────────────────────────────
-    common_socket_events.show_loading_status('Initializing text embedder for web_search…')
+    common_socket_events.show_loading_status('Initializing text embedder for WebSearch…')
     text_embedder = TextEmbedder(cfg=cfg)
     text_embedder.initiate(models_folder=cfg.main.embedding_models_path)
 
     # ── Universal evaluator ──────────────────────────────────────────────
-    common_socket_events.show_loading_status('Loading universal evaluator for web_search…')
+    common_socket_events.show_loading_status('Loading universal evaluator for WebSearch…')
     evaluator = UniversalEvaluator()
     evaluator_path = os.path.join(cfg.main.personal_models_path, 'universal_evaluator.pt')
     if os.path.exists(evaluator_path):
         evaluator.load(evaluator_path)
     else:
-        print("[web_search] universal_evaluator.pt not found – model scoring disabled.")
+        print("[WebSearch] universal_evaluator.pt not found – model scoring disabled.")
 
     # ── Crawler instance ─────────────────────────────────────────────────
     def _crawl_status(msg):
-        socketio.emit('emit_web_search_crawl_progress', {'message': msg})
+        socketio.emit('emit_WebSearch_crawl_progress', {'message': msg})
         common_socket_events.show_search_status(msg)
 
     crawler = SiteCrawler(
@@ -107,7 +107,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
             ratings = evaluator.predict([chunk_embeddings])
             return float(ratings[0])
         except Exception as exc:
-            print(f"[web_search] scoring error for {md_file_path}: {exc}")
+            print(f"[WebSearch] scoring error for {md_file_path}: {exc}")
             return None
 
     def _score_and_update(page_id: int):
@@ -145,7 +145,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
                 if total == 0:
                     _scoring_state['last_hash'] = current_hash
                     return
-                print(f"[web_search] Re-scoring {total} pages with evaluator {current_hash}…")
+                print(f"[WebSearch] Re-scoring {total} pages with evaluator {current_hash}…")
                 for i, page in enumerate(pages):
                     if page.md_file_path is None:
                         continue
@@ -154,10 +154,10 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
                         page.model_rating = rating
                         page.model_hash = current_hash
                     common_socket_events.show_search_status(
-                        f"[web_search] Scoring pages… {i + 1}/{total}"
+                        f"[WebSearch] Scoring pages… {i + 1}/{total}"
                     )
                 db_models.db.session.commit()
-                print(f"[web_search] Scoring complete ({total} pages).")
+                print(f"[WebSearch] Scoring complete ({total} pages).")
                 _scoring_state['last_hash'] = current_hash
         finally:
             _scoring_state['in_progress'] = False
@@ -177,7 +177,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
 
     # ── Socket handlers ──────────────────────────────────────────────────
 
-    @socketio.on('emit_web_search_add_page')
+    @socketio.on('emit_WebSearch_add_page')
     def handle_add_page(data):
         """Add (and crawl) a single page by URL."""
         url = data.get('url', '').strip()
@@ -200,12 +200,12 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
                             db_models.db.session.commit()
                     # Refetch from DB so we have model_rating (and any user_rating just set)
                     page = db_models.WebPage.query.get(page_info['id'])
-                    socketio.emit('emit_web_search_page_added', page.as_dict() if page else page_info)
+                    socketio.emit('emit_WebSearch_page_added', page.as_dict() if page else page_info)
 
         thread = threading.Thread(target=_do_add, daemon=True)
         thread.start()
 
-    @socketio.on('emit_web_search_crawl_site')
+    @socketio.on('emit_WebSearch_crawl_site')
     def handle_crawl_site(data):
         """BFS-crawl a site starting from a seed URL."""
         url = data.get('url', '').strip()
@@ -250,12 +250,12 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
                 _crawl_status(f"Scoring complete – {len(results)} pages crawled.")
             _crawl_status_map[domain] = 'idle'
             # Send updated sites list
-            socketio.emit('emit_web_search_show_sites', _build_sites_list())
+            socketio.emit('emit_WebSearch_show_sites', _build_sites_list())
 
         thread = threading.Thread(target=_do_crawl, daemon=True)
         thread.start()
 
-    @socketio.on('emit_web_search_recrawl_site')
+    @socketio.on('emit_WebSearch_recrawl_site')
     def handle_recrawl_site(data):
         """
         Incrementally recrawl a site.
@@ -290,7 +290,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
                     f"Recrawl complete – {len(changed)} pages updated."
                 )
             _crawl_status_map[domain] = 'idle'
-            socketio.emit('emit_web_search_show_sites', _build_sites_list())
+            socketio.emit('emit_WebSearch_show_sites', _build_sites_list())
 
         thread = threading.Thread(target=_do_recrawl, daemon=True)
         thread.start()
@@ -321,11 +321,11 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
             })
         return result
 
-    @socketio.on('emit_web_search_get_sites')
+    @socketio.on('emit_WebSearch_get_sites')
     def handle_get_sites(data=None):
         return _build_sites_list()
 
-    @socketio.on('emit_web_search_get_folders')
+    @socketio.on('emit_WebSearch_get_folders')
     def handle_get_folders(data=None):
         """
         Build a folder tree dict from md_file_path values.
@@ -371,7 +371,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
 
         return root
 
-    @socketio.on('emit_web_search_get_pages')
+    @socketio.on('emit_WebSearch_get_pages')
     def handle_get_pages(data):
         """
         Return paginated list of pages.
@@ -427,7 +427,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
             'limit': limit,
         }
 
-    @socketio.on('emit_web_search_set_rating')
+    @socketio.on('emit_WebSearch_set_rating')
     def handle_set_rating(data):
         """Set a user rating for a page."""
         page_id = data.get('page_id')
@@ -444,7 +444,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         db_models.db.session.commit()
         return page.as_dict()
 
-    @socketio.on('emit_web_search_get_page_content')
+    @socketio.on('emit_WebSearch_get_page_content')
     def handle_get_page_content(data):
         """Return the markdown content of a stored page."""
         page_id = data.get('page_id')
@@ -458,7 +458,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
             with open(full_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-        socketio.emit('emit_web_search_show_page_content', {
+        socketio.emit('emit_WebSearch_show_page_content', {
             'page_id': page_id,
             'content': content,
         })
