@@ -1,13 +1,21 @@
 import StarRatingComponent from '/modules/StarRating.js';
 import FolderViewComponent from '/modules/FolderViewComponent.js';
 import ContextMenuComponent from '/modules/ContextMenuComponent.js';
+import SearchBarComponent from '/modules/SearchBarComponent.js';
 
-// ── State ────────────────────────────────────────────────────────────────
-let currentPage = 1;
+// ── State (initialised from URL on every page load) ────────────────────
 const PAGE_LIMIT = 14;
-let currentDomain = null;   // null = all sites
-let currentPath = '';        // md_file_path prefix for folder filtering
-let currentOrder = 'rating';
+const _urlParams = new URLSearchParams(window.location.search);
+let currentPage   = parseInt(_urlParams.get('page'))   || 1;
+let currentDomain = _urlParams.get('domain')           || null;
+let currentPath   = decodeURIComponent(_urlParams.get('path') || '');
+let searchState = {
+  text_query:  decodeURIComponent(_urlParams.get('text_query') || ''),
+  mode:        _urlParams.get('mode')        || 'file-name',
+  order:       _urlParams.get('order')       || 'most-relevant',
+  temperature: parseFloat(_urlParams.get('temperature')) || 0,
+  seed:        _urlParams.get('seed')        || null,
+};
 // Add-page modal state
 let _addModalRating = null;
 let _addModalStarInstance = null;
@@ -109,18 +117,19 @@ function renderPagination(page, total, limit) {
   const totalPages = Math.ceil(total / limit);
   if (totalPages <= 1) return;
 
+  const _pageUrl = (num) => {
+    const p = new URLSearchParams(window.location.search);
+    p.set('page', String(num));
+    return '?' + p.toString();
+  };
+
   for (let i = 1; i <= totalPages; i++) {
     if (i === 1 || i === totalPages || Math.abs(i - page) <= 2) {
       const li = document.createElement('li');
       const a = document.createElement('a');
       a.className = 'pagination-link' + (i === page ? ' is-current' : '');
       a.textContent = i;
-      a.href = '#';
-      a.addEventListener('click', (e) => {
-        e.preventDefault();
-        currentPage = i;
-        fetchPages();
-      });
+      a.href = _pageUrl(i);
       li.appendChild(a);
       container.appendChild(li);
     } else if (
@@ -134,13 +143,35 @@ function renderPagination(page, total, limit) {
   }
 }
 
+// ── URL navigation helper ───────────────────────────────────────────────
+
+/**
+ * Navigate to the current page with updated URL params.
+ * Null/empty values are removed from the URL; others are set.
+ */
+function _navigateTo(updates) {
+  const p = new URLSearchParams(window.location.search);
+  for (const [k, v] of Object.entries(updates)) {
+    if (v === null || v === undefined || v === '') {
+      p.delete(k);
+    } else {
+      p.set(k, String(v));
+    }
+  }
+  window.location.search = p.toString();
+}
+
 // ── Data fetching ────────────────────────────────────────────────────────
 
 function fetchPages() {
   const payload = {
     page: currentPage,
     limit: PAGE_LIMIT,
-    order: currentOrder,
+    text_query:  searchState.text_query,
+    mode:        searchState.mode,
+    order:       searchState.order,
+    temperature: searchState.temperature,
+    seed:        searchState.seed,
   };
   if (currentDomain) payload.domain = currentDomain;
   if (currentPath) payload.path = currentPath;
@@ -165,15 +196,16 @@ function fetchSites() {
   socket.emit('emit_WebSearch_get_sites', {}, (sites) => {
     const list = document.getElementById('ws_sites_list');
 
-    // Keep the "All Sites" entry
-    list.innerHTML = '<li><a class="ws-site-item is-active" data-site-id="">All Sites</a></li>';
+    // Keep the "All Sites" entry — mark active if no domain is selected
+    const allActive = !currentDomain ? ' is-active' : '';
+    list.innerHTML = `<li><a class="ws-site-item${allActive}" data-site-id="">All Sites</a></li>`;
 
     if (!sites) return;
 
     sites.forEach((site) => {
       const li = document.createElement('li');
       const a = document.createElement('a');
-      a.className = 'ws-site-item';
+      a.className = 'ws-site-item' + (site.domain === currentDomain ? ' is-active' : '');
       a.dataset.domain = site.domain;
       const status = site.crawl_status === 'crawling' ? ' ⧗' : '';
       a.innerHTML = `${site.domain}${status} <span class="ws-site-count">[${site.pages}]</span>`;
@@ -213,10 +245,8 @@ function _bindFolderTreeClicks() {
     const clickedPath = params.get('path') || '';
 
     // Toggle: if clicking the already-active folder, go back to site root
-    currentPath = (currentPath === clickedPath) ? '' : clickedPath;
-    currentPage = 1;
-    fetchPages();
-    fetchFolders();  // re-render tree with new active path
+    const newPath = (currentPath === clickedPath) ? '' : clickedPath;
+    _navigateTo({ path: newPath || null, page: 1 });
   });
 }
 
@@ -244,13 +274,8 @@ function bindSiteClicks() {
   document.querySelectorAll('.ws-site-item').forEach((el) => {
     el.addEventListener('click', (e) => {
       e.preventDefault();
-      document.querySelectorAll('.ws-site-item').forEach(s => s.classList.remove('is-active'));
-      el.classList.add('is-active');
-      currentDomain = el.dataset.domain || null;
-      currentPath = '';  // reset folder path when switching sites
-      currentPage = 1;
-      fetchPages();
-      fetchFolders();
+      const domain = el.dataset.domain || null;
+      _navigateTo({ domain, path: null, page: 1 });
     });
   });
 }
@@ -450,16 +475,24 @@ $(document).ready(function () {
     }
   });
 
-  // ── Order buttons ─────────────────────────────────────────────────
-  document.querySelectorAll('.ws-order-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.ws-order-btn').forEach(b => b.classList.remove('is-link'));
-      btn.classList.add('is-link');
-      currentOrder = btn.dataset.order;
-      currentPage = 1;
-      fetchPages();
-    });
+  // ── Search bar ────────────────────────────────────────────────────
+  // autoSyncUrl + ensureDefaultsInUrl: any search/mode/order/temp change
+  // rewrites the URL and reloads the page, matching the pattern used by
+  // the text, images, music and videos modules.
+  const _searchBar = new SearchBarComponent({
+    container: document.getElementById('ws_search_bar'),
+    enableModes: ['file-name', 'semantic-content'],
+    showOrder: true,
+    showTemperature: true,
+    temperatures: [0, 0.2, 1, 2],
+    keywords: ['rating', 'recommendation', 'recent'],
+    autoSyncUrl: true,
+    ensureDefaultsInUrl: true
   });
+  // Sync searchState from the component (which has already read/normalised URL params)
+  Object.assign(searchState, _searchBar.getState());
+  _searchBar.searchInput.placeholder =
+    'Search pages by title/URL, or enter: rating · recommendation · recent';
 
   // ── Close modal ───────────────────────────────────────────────────
   document.querySelectorAll('.ws-modal-close').forEach((el) => {

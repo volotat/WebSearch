@@ -7,16 +7,18 @@ optional model scoring.
 """
 
 import os
+import io
 import re
 import time
 import hashlib
 import datetime
+import tempfile
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-from markitdown import MarkItDown
+from markitdown import MarkItDown, StreamInfo
 
 import modules.WebSearch.db_models as db_models
 
@@ -87,6 +89,65 @@ def _extract_title(html: str) -> str:
     soup = BeautifulSoup(html, 'html.parser')
     tag = soup.find('title')
     return tag.get_text(strip=True) if tag else ''
+
+
+# Tags that are almost always boilerplate (navigation, chrome, ads).
+_BOILERPLATE_TAGS = frozenset({
+    'nav', 'header', 'footer', 'aside',
+    'form', 'dialog', 'menu', 'menuitem',
+})
+
+# ARIA roles whose elements are never main content.
+_BOILERPLATE_ROLES = frozenset({
+    'navigation', 'banner', 'complementary', 'contentinfo',
+    'search', 'menubar', 'toolbar', 'status',
+})
+
+# Class/id substrings that reliably indicate boilerplate.
+_BOILERPLATE_PATTERNS = (
+    'nav', 'navbar', 'sidebar', 'side-bar', 'menu', 'header', 'footer',
+    'breadcrumb', 'cookie', 'banner', 'advertisement', 'advert', ' ads-',
+    'social-share', 'share-buttons', 'related-posts', 'related-articles',
+    'comment', 'widget', 'popup', 'modal', 'overlay', 'toast',
+)
+
+
+def _strip_boilerplate(html: str) -> str:
+    """
+    Remove structural boilerplate from an HTML page using BeautifulSoup
+    (already a project dependency) before passing to markitdown.
+
+    Strategy (in order of reliability):
+      1. Remove semantic HTML5 layout tags (<nav>, <header>, <footer>, <aside>).
+      2. Remove elements whose ARIA role marks them as non-content.
+      3. Remove elements whose class or id contains a boilerplate keyword.
+
+    Operates on the raw HTML string and returns cleaned HTML.
+    Falls back to the original HTML if anything goes wrong.
+    """
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # 1. Semantic tags
+        for tag in soup.find_all(_BOILERPLATE_TAGS):
+            tag.decompose()
+
+        # 2. ARIA roles
+        for tag in soup.find_all(role=True):
+            if tag.get('role', '').lower() in _BOILERPLATE_ROLES:
+                tag.decompose()
+
+        # 3. Class / id patterns
+        for tag in soup.find_all(True):
+            classes = ' '.join(tag.get('class') or [])
+            elem_id = tag.get('id') or ''
+            combined = (classes + ' ' + elem_id).lower()
+            if any(pat in combined for pat in _BOILERPLATE_PATTERNS):
+                tag.decompose()
+
+        return str(soup)
+    except Exception:
+        return html  # never break the crawl
 
 
 def _extract_same_domain_links(html: str, base_url: str, domain: str):
@@ -290,16 +351,28 @@ class SiteCrawler:
                 ):
                     return {'_links': same_domain_links, '_unchanged': True, 'id': existing.id}
 
-        # Convert to Markdown via markitdown.
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=tmp_suffix, delete=False, mode='wb') as tmp:
-            tmp.write(raw_bytes)
-            tmp_path = tmp.name
-        try:
-            md_result = self._markitdown.convert(tmp_path)
+        # Convert to Markdown.
+        # For HTML pages: first strip structural boilerplate (nav, header,
+        # footer, sidebars, …) using BeautifulSoup, then pass the cleaned
+        # HTML to markitdown.  This uses only the bs4 dependency that is
+        # already required by the project — no new libraries needed.
+        # For non-HTML documents (PDF, DOCX, …): use markitdown as-is.
+        if is_html:
+            cleaned_html = _strip_boilerplate(resp.text)
+            md_result = self._markitdown.convert_stream(
+                io.BytesIO(cleaned_html.encode('utf-8')),
+                stream_info=StreamInfo(mimetype='text/html', charset='utf-8', url=url),
+            )
             md_text = md_result.text_content if md_result else ''
-        finally:
-            os.unlink(tmp_path)
+        else:
+            with tempfile.NamedTemporaryFile(suffix=tmp_suffix, delete=False, mode='wb') as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                md_result = self._markitdown.convert(tmp_path)
+                md_text = md_result.text_content if md_result else ''
+            finally:
+                os.unlink(tmp_path)
 
         # Build filesystem path
         md_path = _url_to_filepath(url, self.storage_dir)

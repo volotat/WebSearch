@@ -9,6 +9,7 @@ import datetime
 import threading
 from urllib.parse import urlparse
 
+import torch
 from flask import Flask
 from flask_socketio import SocketIO
 
@@ -21,6 +22,11 @@ from modules.WebSearch.crawler import SiteCrawler
 from src.socket_events import CommonSocketEvents
 from src.text_embedder import TextEmbedder
 from modules.train.universal_train import UniversalEvaluator
+import rapidfuzz.fuzz
+from src.utils import weighted_shuffle
+from src.caching import TwoLevelCache
+from src.common_filters import CommonFilters, _normalize_text
+from src.recommendation_engine import sort_files_by_recommendation
 
 # ── Event catalogue ──────────────────────────────────────────────────────
 #
@@ -42,6 +48,85 @@ from modules.train.universal_train import UniversalEvaluator
 # ─────────────────────────────────────────────────────────────────────────
 
 
+# ── _WebSearchTextEngine ─────────────────────────────────────────────────
+# A minimal engine adapter that gives CommonFilters the interface it needs
+# to operate on WebSearch .md files — exactly the same way TextSearch does
+# for the text module, just pointing at a different folder.
+#
+# Hash strategy: re-uses the blake2b hash the crawler already stored in
+# WebPage.hash so that CommonFilters.filter_by_rating can resolve ratings
+# via the existing WebPage table without any schema changes.  Hashes are
+# seeded per request from the already-fetched page list (no extra I/O).
+
+class _WebSearchTextEngine:
+    def __init__(self, text_embedder, page_emb_cache, storage_dir):
+        self._emb           = text_embedder
+        self._cache         = page_emb_cache
+        self.storage_dir    = storage_dir
+        self._path_hash     = {}   # abs_path → WebPage.hash, refreshed per request
+        self._emb_dim_cache = None
+
+    def seed_hashes(self, pages):
+        """Prime the path→hash map from an already-fetched WebPage list."""
+        self._path_hash = {
+            os.path.join(self.storage_dir, p.md_file_path): p.hash
+            for p in pages if p.md_file_path and p.hash
+        }
+
+    def seed_titles(self, path_to_page):
+        """Prime the path→(title, url) map so fuzzy search can match human-readable text."""
+        self._path_title = {
+            path: (page.title or '', page.url or '')
+            for path, page in path_to_page.items()
+        }
+
+    def get_title_and_url(self, path):
+        """Return (title, url) for a path, falling back to basename."""
+        return getattr(self, '_path_title', {}).get(path, (os.path.basename(path), ''))
+
+    def get_file_hash(self, path: str) -> str:
+        return self._path_hash.get(path, '')
+
+    def get_hash_algorithm(self) -> str:
+        return 'blake2b:v1'
+
+    def process_text(self, text: str):
+        return np.array(self._emb.embed_text(text))
+
+    def _emb_dim(self) -> int:
+        if self._emb_dim_cache is None:
+            try:   self._emb_dim_cache = self._emb.embedding_dim or 1024
+            except Exception: self._emb_dim_cache = 1024
+        return self._emb_dim_cache
+
+    def process_files(self, file_paths, callback=None, media_folder=None):
+        rows = []
+        for path in file_paths:
+            cache_key = f'emb:{self._path_hash.get(path, path)}'
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                rows.append(cached)
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8') as fh:
+                    content = fh.read()
+                emb = self._emb.embed_text(content)
+                vec = np.array(emb).mean(axis=0) if emb is not None and len(emb) else np.zeros(self._emb_dim())
+            except Exception:
+                vec = np.zeros(self._emb_dim())
+            self._cache.set(cache_key, vec)
+            rows.append(vec)
+        return torch.tensor(np.stack(rows), dtype=torch.float32) if rows else torch.zeros((0, self._emb_dim()))
+
+    def compare(self, embeds_files, embeds_text):
+        ef = embeds_files.numpy() if isinstance(embeds_files, torch.Tensor) else np.array(embeds_files)
+        qt = np.array(embeds_text)
+        if qt.ndim > 1:
+            qt = qt.mean(axis=0)
+        norms = np.linalg.norm(ef, axis=1) * np.linalg.norm(qt)
+        return np.dot(ef, qt) / np.maximum(norms, 1e-8)
+
+
 def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_folder='./project_data'):
     common_socket_events = CommonSocketEvents(socketio, module_name="WebSearch")
 
@@ -49,6 +134,12 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
     storage_dir = OmegaConf.select(cfg, "WebSearch.storage_directory",
                                    default="/mnt/project_config/modules/WebSearch")
     os.makedirs(storage_dir, exist_ok=True)
+
+    # ── Page embedding cache (for semantic search) ───────────────────────
+    page_emb_cache = TwoLevelCache(
+        cache_dir=os.path.join(cfg.main.cache_path, 'WebSearch'),
+        name='page_embeddings',
+    )
 
     # ── Crawler settings ─────────────────────────────────────────────────
     crawl_delay = OmegaConf.select(cfg, "WebSearch.crawl_delay", default=1.0)
@@ -58,6 +149,25 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
     common_socket_events.show_loading_status('Initializing text embedder for WebSearch…')
     text_embedder = TextEmbedder(cfg=cfg)
     text_embedder.initiate(models_folder=cfg.main.embedding_models_path)
+
+    ws_engine = _WebSearchTextEngine(text_embedder, page_emb_cache, storage_dir)
+
+    def _update_model_ratings(file_paths):
+        """Bridge: CommonFilters passes abs .md paths; we score the matching WebPages."""
+        for abs_path in file_paths:
+            rel = os.path.relpath(abs_path, storage_dir)
+            page = db_models.WebPage.query.filter_by(md_file_path=rel).first()
+            if page:
+                _score_and_update(page.id)
+
+    ws_filters = CommonFilters(
+        engine=ws_engine,
+        metadata_engine=None,
+        common_socket_events=common_socket_events,
+        media_directory=storage_dir,
+        db_schema=db_models.WebPage,
+        update_model_ratings_func=_update_model_ratings,
+    )
 
     # ── Universal evaluator ──────────────────────────────────────────────
     common_socket_events.show_loading_status('Loading universal evaluator for WebSearch…')
@@ -373,57 +483,108 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
 
     @socketio.on('emit_WebSearch_get_pages')
     def handle_get_pages(data):
-        """
-        Return paginated list of pages.
-        Accepts: page (1-based), limit, domain (optional), path (optional),
-                 order (optional).
-        Pages without any rating (neither user nor model) are excluded.
-        """
-        page_num = max(1, data.get('page', 1))
-        limit = min(data.get('limit', 20), 100)
-        domain = data.get('domain', None)
-        path = data.get('path', '')  # md_file_path prefix filter
-        order = data.get('order', 'rating')  # rating | recent | alpha
+        """Return a paginated, scored list of rated pages."""
+        page_n      = max(1, data.get('page', 1))
+        limit       = min(data.get('limit', 20), 100)
+        text_query  = (data.get('text_query', '') or '').strip()
+        mode        = data.get('mode', 'file-name')
+        order       = data.get('order', 'most-relevant')
+        temperature = float(data.get('temperature', 0))
+        seed        = data.get('seed', None)
 
-        query = db_models.WebPage.query
+        if seed is not None:
+            try: np.random.seed(int(seed) % (2 ** 32))
+            except (ValueError, OverflowError): pass
 
-        # Hide pages that have no rating at all
-        query = query.filter(
+        # Build candidate set (rated pages, scoped to domain / folder path)
+        base_q = db_models.WebPage.query.filter(
             (db_models.WebPage.user_rating.isnot(None)) |
             (db_models.WebPage.model_rating.isnot(None))
         )
+        if data.get('domain'): base_q = base_q.filter_by(domain=data['domain'])
+        if data.get('path'):   base_q = base_q.filter(db_models.WebPage.md_file_path.like(f"{data['path']}%"))
+        all_pages = base_q.all()
+        if not all_pages:
+            return {'pages': [], 'total': 0, 'page': page_n, 'limit': limit}
 
-        if domain:
-            query = query.filter_by(domain=domain)
+        # Map absolute .md path → WebPage (mirrors media_directory → file in other modules)
+        all_files    = [os.path.join(storage_dir, p.md_file_path) for p in all_pages if p.md_file_path]
+        path_to_page = {os.path.join(storage_dir, p.md_file_path): p for p in all_pages if p.md_file_path}
 
-        # Filter by md_file_path prefix (folder navigation)
-        if path:
-            query = query.filter(db_models.WebPage.md_file_path.like(f'{path}%'))
+        # Align engine hashes so CommonFilters.filter_by_rating resolves correctly
+        ws_engine.seed_hashes(all_pages)
+        ws_engine.seed_titles(path_to_page)
 
-        # Ordering
-        if order == 'recent':
-            query = query.order_by(db_models.WebPage.crawl_date.desc())
-        elif order == 'alpha':
-            query = query.order_by(db_models.WebPage.title.asc())
+        # WebSearch-specific extra filters (recommendation, recency)
+        def _filter_recommendation(files, *_, **__):
+            files_data = [
+                {'user_rating': path_to_page[f].user_rating, 'model_rating': path_to_page[f].model_rating,
+                 'full_play_count': 1, 'skip_count': 0, 'last_played': path_to_page[f].last_crawl_date}
+                for f in files if f in path_to_page
+            ]
+            return np.array(sort_files_by_recommendation(files, files_data), dtype=np.float32)
+
+        def _filter_recent(files, *_, **__):
+            ts = np.array([path_to_page[f].crawl_date.timestamp()
+                           if f in path_to_page and path_to_page[f].crawl_date else 0.0
+                           for f in files], dtype=np.float32)
+            rng = ts.max() - ts.min()
+            return (ts - ts.min()) / (rng + 1e-8)
+
+        # Fuzzy file-name filter: match against page title + URL instead of
+        # the on-disk .md filename (which is a meaningless blake2b hash).
+        def _filter_fuzzy_title(files, text_query, **__):  # noqa: E306
+            q = _normalize_text(text_query)
+            q_raw = text_query.strip().lower()
+            scorer = rapidfuzz.fuzz.token_set_ratio if ' ' in q else rapidfuzz.fuzz.WRatio
+            scores = []
+            for f in files:
+                title, url = ws_engine.get_title_and_url(f)
+                s_title = scorer(q, _normalize_text(title))
+                s_url   = scorer(q, _normalize_text(url))
+                combined = max(1.3 * s_title, s_url)
+                # exact-match boost (same priority logic as CommonFilters)
+                priority = 0
+                if q_raw and q_raw in title.lower():
+                    priority = 3
+                elif q_raw and q_raw in url.lower():
+                    priority = 2
+                scores.append(priority * 10.0 + combined)
+            return np.array(scores, dtype=np.float32) / 100.0
+
+        def _filter_by_text(files, text_query, mode='file-name', **kw):
+            if mode == 'file-name':
+                return _filter_fuzzy_title(files, text_query)
+            return ws_filters.filter_by_text(files, text_query, mode=mode, **kw)
+
+        # Filter dispatch table – same pattern as text module
+        filters = {
+            'by_text':        _filter_by_text,
+            'rating':         ws_filters.filter_by_rating,
+            'recommendation': _filter_recommendation,
+            'recent':         _filter_recent,
+        }
+
+        # Route to appropriate filter (mirrors FileManager.get_files logic)
+        query       = text_query or 'rating'
+        filter_name = query.split()[0]
+        if filter_name in filters and filter_name != 'by_text':
+            scores = filters[filter_name](all_files, query)
         else:
-            # Default: highest effective rating first (user > model)
-            effective_rating = db_models.db.func.coalesce(
-                db_models.WebPage.user_rating,
-                db_models.WebPage.model_rating,
-                0,
-            )
-            query = query.order_by(effective_rating.desc())
+            scores = filters['by_text'](all_files, query, mode=mode)
 
-        total = query.count()
-        pages = query.offset((page_num - 1) * limit).limit(limit).all()
+        indices = weighted_shuffle(scores, temperature=temperature)
+        if order == 'least-relevant':
+            indices = list(reversed(indices))
+        sorted_files = [all_files[i] for i in indices]
+        offset = (page_n - 1) * limit
 
-        # Kick off background rescoring if the evaluator was retrained
         _maybe_trigger_rescore()
 
         return {
-            'pages': [p.as_dict() for p in pages],
-            'total': total,
-            'page': page_num,
+            'pages': [path_to_page[f].as_dict() for f in sorted_files[offset:offset + limit] if f in path_to_page],
+            'total': len(sorted_files),
+            'page':  page_n,
             'limit': limit,
         }
 
@@ -464,11 +625,50 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         })
         return {'page_id': page_id, 'content': content}
 
-    # ── Startup scoring (non-blocking) ───────────────────────────────────
-    # Launch in a background thread so the module becomes available immediately.
-    # Progress is shown in the status bar via show_search_status.
+    def _restore_missing_md_files():
+        """
+        Background startup task: find every WebPage record whose .md file no
+        longer exists on disk and silently re-crawl it to restore the file.
+
+        Runs once at module startup in a daemon thread so it never blocks page
+        requests.  No user action is ever required — the recovery is fully
+        automatic.  Pages whose URLs are no longer reachable are skipped
+        gracefully (the DB record is preserved with whatever metadata was
+        already there).
+        """
+        with app.app_context():
+            all_pages = db_models.WebPage.query.filter(
+                db_models.WebPage.md_file_path.isnot(None)
+            ).all()
+
+            missing = [
+                p for p in all_pages
+                if not os.path.exists(os.path.join(storage_dir, p.md_file_path))
+            ]
+
+        if not missing:
+            return
+
+        print(f"[WebSearch] {len(missing)} .md file(s) missing — restoring in background…")
+        for i, page in enumerate(missing):
+            common_socket_events.show_search_status(
+                f"[WebSearch] Restoring missing page {i + 1}/{len(missing)}: {page.url}"
+            )
+            try:
+                crawler.crawl_single_page(page.url, app=app)
+            except Exception as exc:
+                print(f"[WebSearch] Could not restore {page.url}: {exc}")
+
+        common_socket_events.show_search_status("")
+        print(f"[WebSearch] Restoration complete — {len(missing)} page(s) processed.")
+
+    # ── Startup background tasks (non-blocking) ──────────────────────────
+    # Both threads are daemon threads; they die with the process and never
+    # block module startup or page requests.
+    # 1. Restore any .md files that were deleted from disk.
+    threading.Thread(target=_restore_missing_md_files, daemon=True).start()
+    # 2. Score pages that lack a model rating or have a stale model_hash.
     if os.path.exists(evaluator_path):
-        thread = threading.Thread(target=_bulk_score_unscored, daemon=True)
-        thread.start()
+        threading.Thread(target=_bulk_score_unscored, daemon=True).start()
 
     common_socket_events.show_loading_status('Web Search module ready!')

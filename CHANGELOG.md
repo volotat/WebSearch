@@ -1,5 +1,18 @@
 # Web Search Module - Changelog
 
+### Version 0.1.2 (21.03.2026)
+*   **Search & Filtering**
+    *   Search bar integration: replaced the static order buttons with `SearchBarComponent` (shared with text/images/music/video modules). Supports fuzzy title/URL search (`file-name` mode) and semantic content search (`semantic-content` mode), plus keyword shortcuts: `rating`, `recommendation`, `recent`.
+    *   URL-driven navigation: switched from SPA-style socket-on-demand to the same URL-reload pattern used by all other modules (`autoSyncUrl: true`, `ensureDefaultsInUrl: true`). Search mode, order, temperature, seed, page, domain, and folder path are all persisted in the URL — browser back/forward and bookmarks work correctly. Pagination links are real `href` URLs; site and folder clicks call `_navigateTo()` to rewrite the URL and reload.
+    *   Fuzzy search fix: `file-name` mode now matches against `page.title` (1.3× weight) and `page.url` instead of using only the on-disk `.md` filename. Implemented as a local `_filter_fuzzy_title()` closure in `handle_get_pages` using `rapidfuzz` and `_normalize_text` already available from `CommonFilters`. Semantic search (`semantic-content` mode) is unchanged.
+    *   Recommendation sort: added `recommendation` keyword routed to `sort_files_by_recommendation` (same engine as other modules).
+    *   `CommonFilters` reuse: removed the bespoke `WebSearchFilters` class; WebSearch now uses `CommonFilters` directly via a `_WebSearchTextEngine` adapter. The adapter's `seed_hashes()` / `seed_titles()` methods are called per request to map `.md` paths to the DB-stored blake2b hash and human-readable title/URL without extra I/O.
+*   **Crawler**
+    *   HTML boilerplate stripping: before passing HTML to markitdown, a `_strip_boilerplate()` pre-processing step removes semantic layout tags (`<nav>`, `<header>`, `<footer>`, `<aside>`, `<form>`, `<dialog>`), elements with boilerplate ARIA roles (`navigation`, `banner`, `contentinfo`, etc.), and elements whose `class` or `id` matches common patterns (`sidebar`, `breadcrumb`, `cookie`, `social-share`, `related-posts`, etc.). Falls back to the original HTML silently on any error. Non-HTML documents (PDF, DOCX, …) are unaffected.
+    *   HTML conversion uses `markitdown.convert_stream()` with a `StreamInfo` object instead of writing a temp file for HTML pages.
+*   **Reliability**
+    *   Automatic `.md` file restoration: a `_restore_missing_md_files()` background daemon thread runs at every startup. It compares `md_file_path` values in the DB against the filesystem and silently re-crawls any URL whose file is missing. Unreachable URLs are skipped gracefully (DB record retained).
+
 ### Version 0.1.1 (14.03.2026)
 *   **Crawler**
     *   Incremental Recrawl: `SiteCrawler.crawl_site()` gains a `recrawl` parameter. When `True`, the raw HTTP response bytes are hashed (BLAKE2b) immediately after fetching, before markitdown is ever invoked. If the hash matches the stored value the page is skipped entirely — but its links are still extracted from the freshly-fetched HTML so index/listing pages (e.g. `/articles`, `/r/LocalLLaMA/`) can still surface new content.

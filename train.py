@@ -77,5 +77,4 @@ def get_training_pairs(cfg, text_embedder, status_callback=None):
             print(f"[WebSearch/train] Error processing {entry.md_file_path}: {exc}")
             continue
 
-        if status_callback and (i + 1) % 10 == 0:
-            status_callback(f"WebSearch: embedded {i + 1}/{total} pages...")
+        status_callback(f"WebSearch: embedded {i + 1}/{total} pages...")
