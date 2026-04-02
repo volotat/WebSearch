@@ -62,20 +62,7 @@
   .ws-star-user { color: hsl(217, 71%, 45%) !important; }   /* dark blue  – has-text-link */
   .ws-star-model { color: hsl(204, 71%, 53%) !important; }   /* light blue – has-text-info */
 
-  /* ── Sidebar sites list ─────────────────────────────────────────────── */
-  .ws-site-item {
-    cursor: pointer;
-    padding: .35rem .5rem;
-    border-radius: 4px;
-    margin-bottom: 2px;
-  }
-  .ws-site-item:hover, .ws-site-item.is-active {
-    background: hsl(217, 71%, 95%);
-  }
-  .ws-site-item .ws-site-count {
-    font-size: .78rem;
-    color: #888;
-  }
+
 </style>
 
 <div class="container is-fluid columns is-centered py-6 mb-6">
@@ -88,14 +75,8 @@
       + Add page
     </button>
 
-    <!-- All Pages link -->
-    <ul class="menu-list" id="ws_sites_list">
-      <li><a class="ws-site-item is-active" data-site-id="">All Sites</a></li>
-      <!-- Sites injected here by JS -->
-    </ul>
-
-    <!-- Folder tree (populated by FolderViewComponent after selecting a site) -->
-    <div id="ws_folder_tree" class="mt-3"></div>
+    <!-- Folder tree (populated by FolderViewComponent) -->
+    <div id="ws_folder_tree"></div>
 
     <!-- Crawl progress -->
     <p class="help mt-3" id="ws_crawl_status"></p>
@@ -177,19 +158,37 @@
   <div class="modal-background ws-recrawl-modal-close"></div>
   <div class="modal-card" style="max-width: 520px; width: 95%;">
     <header class="modal-card-head py-4 px-4">
-      <p class="modal-card-title">Recrawl site</p>
+      <p class="modal-card-title">Recrawl folder</p>
       <button class="delete ws-recrawl-modal-close" aria-label="close"></button>
     </header>
     <section class="modal-card-body">
 
-      <!-- Seed URL -->
+      <!-- Folder info -->
       <div class="field">
+        <label class="label">Folder</label>
+        <div class="control">
+          <input class="input" id="ws_recrawl_folder" type="text" readonly>
+        </div>
+      </div>
+
+      <!-- Bulk mode notice (shown when folder has no .crawl.yaml but sub-sites do) -->
+      <div class="notification is-info is-light p-3 mt-4 mb-0" id="ws_recrawl_bulk_notice" style="display:none;">
+        No <code>.crawl.yaml</code> at this level — will recrawl each sub-site individually:
+        <ul class="mt-1 ml-5" id="ws_recrawl_bulk_sites" style="list-style:disc;"></ul>
+        <span class="is-size-7 has-text-grey">Delay and max-pages below are applied per site, overriding per-site settings.</span>
+      </div>
+
+      <!-- Single-site fields (hidden in bulk mode) -->
+      <div id="ws_recrawl_single_fields">
+
+      <!-- Seed URL (read from .crawl.yaml, editable) -->
+      <div class="field mt-4">
         <label class="label">Seed URL</label>
         <div class="control">
           <input class="input" id="ws_recrawl_url" type="url"
                  placeholder="https://example.com">
         </div>
-        <p class="help">Crawl starts here. Only same-domain links are followed. Pages whose raw content hasn&rsquo;t changed are skipped but still traversed for new links.</p>
+        <p class="help">Read from <code>.crawl.yaml</code>. Pages whose raw content hasn&rsquo;t changed are skipped.</p>
       </div>
 
       <!-- Sublinks only -->
@@ -199,6 +198,8 @@
           Crawl only sublinks (pages under this URL path)
         </label>
       </div>
+
+      </div><!-- end #ws_recrawl_single_fields -->
 
       <!-- Crawl delay -->
       <div class="field mt-4">
@@ -215,9 +216,9 @@
         <label class="label">Max pages to visit</label>
         <div class="control" style="max-width: 150px;">
           <input class="input" id="ws_recrawl_max_pages_input" type="number"
-                 min="1" max="100000" step="1" value="5000">
+                 min="1" max="100000" step="1" value="300">
         </div>
-        <p class="help">Upper bound on pages fetched in this run (unchanged pages count toward this limit).</p>
+        <p class="help">Upper bound on pages fetched in this run.</p>
       </div>
 
     </section>

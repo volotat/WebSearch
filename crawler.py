@@ -4,6 +4,11 @@ Web crawler for IndieWeb blog exploration.
 Fetches HTML pages, converts them to Markdown via markitdown,
 extracts same-domain links, and performs BFS crawling with
 optional model scoring.
+
+Each .md file includes a YAML front-matter header with metadata
+(url, domain, title, preview, crawl dates).  The file hash is
+computed from the final .md bytes (front-matter + body) so that
+any content or metadata change produces a new hash.
 """
 
 import os
@@ -15,6 +20,7 @@ import datetime
 import tempfile
 from urllib.parse import urljoin, urlparse
 
+import yaml
 import requests
 from bs4 import BeautifulSoup
 
@@ -91,7 +97,93 @@ def _extract_title(html: str) -> str:
     return tag.get_text(strip=True) if tag else ''
 
 
-# Tags that are almost always boilerplate (navigation, chrome, ads).
+# ---------------------------------------------------------------------------
+# Front-matter helpers
+# ---------------------------------------------------------------------------
+
+def build_frontmatter(meta: dict) -> str:
+    """Produce ``---\\n...\\n---\\n`` YAML front-matter from *meta* dict."""
+    lines = ['---']
+    for key, value in meta.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            lines.append(f'{key}: "{value}"')
+        else:
+            lines.append(f'{key}: {value}')
+    lines.append('---')
+    return '\n'.join(lines) + '\n'
+
+
+def parse_frontmatter(md_text: str) -> tuple[dict, str]:
+    """
+    Parse YAML front-matter from a markdown string.
+
+    Returns (meta_dict, body_text).  If no valid front-matter is found,
+    returns ({}, full_text).
+    """
+    if not md_text.startswith('---'):
+        return {}, md_text
+    end = md_text.find('\n---', 3)
+    if end == -1:
+        return {}, md_text
+    yaml_block = md_text[4:end]
+    body = md_text[end + 4:]
+    if body.startswith('\n'):
+        body = body[1:]
+    try:
+        meta = yaml.safe_load(yaml_block) or {}
+    except yaml.YAMLError:
+        return {}, md_text
+    return meta, body
+
+
+# ---------------------------------------------------------------------------
+# .crawl.yaml helpers
+# ---------------------------------------------------------------------------
+
+def write_crawl_yaml(folder: str, seed_url: str, sublinks_only: bool = False,
+                     crawl_delay: float = 1.0, max_pages: int = 50):
+    """Write (or update) a .crawl.yaml in *folder*."""
+    path = os.path.join(folder, '.crawl.yaml')
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            data = {}
+    data.update({
+        'seed_url': seed_url,
+        'sublinks_only': sublinks_only,
+        'crawl_delay': crawl_delay,
+        'max_pages': max_pages,
+        'last_crawl': datetime.datetime.utcnow().isoformat(),
+    })
+    os.makedirs(folder, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(data, f, default_flow_style=False)
+
+
+def read_crawl_yaml(folder: str) -> dict | None:
+    """
+    Read .crawl.yaml from *folder*.
+    Returns the parsed dict or None.
+    """
+    path = os.path.join(folder, '.crawl.yaml')
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Boilerplate stripping
+# ---------------------------------------------------------------------------
+
 _BOILERPLATE_TAGS = frozenset({
     'nav', 'header', 'footer', 'aside',
     'form', 'dialog', 'menu', 'menuitem',
@@ -186,6 +278,9 @@ def _url_to_filepath(url: str, storage_dir: str) -> str:
 # Crawler
 # ---------------------------------------------------------------------------
 
+HASH_ALGORITHM = 'blake2b:v1'
+
+
 class SiteCrawler:
     """
     BFS crawler that converts pages to Markdown and stores them.
@@ -193,8 +288,7 @@ class SiteCrawler:
     Parameters
     ----------
     storage_dir : str
-        Root directory where .md files are written
-        (e.g. ``/mnt/project_config/modules/WebSearch``).
+        Root directory where .md files are written.
     crawl_delay : float
         Seconds to wait between HTTP requests (default 1.0).
     max_pages : int
@@ -204,8 +298,6 @@ class SiteCrawler:
     status_callback : callable or None
         ``fn(message: str)`` called to report progress.
     """
-
-    HASH_ALGORITHM = 'blake2b:v1'
 
     def __init__(
         self,
@@ -227,35 +319,18 @@ class SiteCrawler:
     def crawl_site(self, start_url: str, app=None, sublinks_only: bool = False, recrawl: bool = False):
         """
         Crawl starting from *start_url* (BFS, same-domain only).
-
-        Parameters
-        ----------
-        start_url : str
-            The seed URL to begin crawling from.
-        app : Flask app
-            Needed for DB access in a background thread.
-        sublinks_only : bool
-            When True only follow links whose URL path begins with the
-            start URL's path (e.g. only pages inside a specific subreddit).
-        recrawl : bool
-            When True, pages whose raw HTTP content hash hasn't changed are
-            skipped (markitdown is never called), but their links are still
-            followed so new pages on index/listing pages are discovered.
-
-        Returns
-        -------
-        list[dict]
-            List of page info dicts for every page successfully crawled.
+        Returns list of page info dicts for every page successfully crawled.
         """
         start_url = _normalise_url(start_url)
         domain = urlparse(start_url).netloc
-        # Path prefix used when sublinks_only=True
         start_path_prefix = urlparse(start_url).path.rstrip('/')
 
         visited = set()
         queue = [start_url]
         results = []
         skipped = 0
+        crawl_yaml_written = set()  # track folders where .crawl.yaml was already written
+        scheme = urlparse(start_url).scheme or 'https'
 
         while queue and len(visited) < self.max_pages:
             url = queue.pop(0)
@@ -276,7 +351,30 @@ class SiteCrawler:
                     skipped += 1
                 else:
                     results.append(page_info)
-                # Extract links for BFS regardless of whether the page changed
+
+                    # Write .crawl.yaml in the folder where this page was saved
+                    # and in every parent folder up to (and including) the domain root.
+                    # Each folder gets a seed_url matching its URL path so that
+                    # recrawling a subfolder starts from the correct URL.
+                    if page_info.get('file_path'):
+                        md_abs = os.path.join(self.storage_dir, page_info['file_path'])
+                        folder = os.path.dirname(md_abs)
+                        domain_folder = os.path.join(self.storage_dir, domain)
+                        while folder and len(folder) >= len(domain_folder):
+                            if folder not in crawl_yaml_written:
+                                # Derive the seed URL for this folder from its path
+                                rel = os.path.relpath(folder, domain_folder)
+                                if rel == '.':
+                                    folder_seed_url = f'{scheme}://{domain}/'
+                                else:
+                                    folder_seed_url = f'{scheme}://{domain}/{rel}/'
+                                write_crawl_yaml(folder, folder_seed_url, sublinks_only,
+                                                 self.crawl_delay, self.max_pages)
+                                crawl_yaml_written.add(folder)
+                            if folder == domain_folder:
+                                break
+                            folder = os.path.dirname(folder)
+
                 for link in page_info.get('_links', []):
                     if link in visited:
                         continue
@@ -286,9 +384,14 @@ class SiteCrawler:
                             continue
                     queue.append(link)
 
-            # Polite delay between requests
             if queue:
                 time.sleep(self.crawl_delay)
+
+        # Ensure domain root always has a .crawl.yaml even if all pages were unchanged
+        domain_folder = os.path.join(self.storage_dir, domain)
+        if domain_folder not in crawl_yaml_written:
+            write_crawl_yaml(domain_folder, start_url, sublinks_only,
+                             self.crawl_delay, self.max_pages)
 
         if recrawl:
             self._status(f"Recrawl complete – {len(results)} updated, {skipped} unchanged for {domain}")
@@ -323,40 +426,29 @@ class SiteCrawler:
         is_html = 'html' in content_type.lower()
         raw_bytes = resp.content
 
-        # Compute fast hash of raw HTTP bytes (used for change detection)
-        file_hash = _blake2b(raw_bytes)
+        # Quick hash of raw HTTP bytes — used for recrawl change detection only
+        raw_hash = _blake2b(raw_bytes)
 
         if is_html:
-            # ── HTML page ──────────────────────────────────────────────
             title = _extract_title(resp.text)
             same_domain_links = list(_extract_same_domain_links(resp.text, url, domain))
-            tmp_suffix = '.html'
         else:
-            # ── Non-HTML resource — accept only markitdown-supported docs
             tmp_suffix = _temp_ext_for(url, content_type)
             if tmp_suffix is None:
-                return None  # image, binary, stylesheet, etc. — skip silently
-            title = ''          # no <title> tag in documents; URL used as fallback in UI
-            same_domain_links = []  # documents don't contain navigable same-domain links
+                return None
+            title = ''
+            same_domain_links = []
 
-        # ── Recrawl fast-path: skip markitdown if raw content is unchanged ─
-        # Links are still returned so BFS can discover new pages on index pages.
+        # ── Recrawl fast-path ─────────────────────────────────────────
+        # Compare raw HTTP hash against DB raw_hash for fast change detection
+        # without reading .md files from disk.
         if recrawl:
             with app.app_context():
                 existing = db_models.WebPage.query.filter_by(url=url).first()
-                if (
-                    existing and
-                    existing.hash_algorithm == self.HASH_ALGORITHM and
-                    existing.hash == file_hash
-                ):
+                if existing and existing.raw_hash == raw_hash:
                     return {'_links': same_domain_links, '_unchanged': True, 'id': existing.id}
 
-        # Convert to Markdown.
-        # For HTML pages: first strip structural boilerplate (nav, header,
-        # footer, sidebars, …) using BeautifulSoup, then pass the cleaned
-        # HTML to markitdown.  This uses only the bs4 dependency that is
-        # already required by the project — no new libraries needed.
-        # For non-HTML documents (PDF, DOCX, …): use markitdown as-is.
+        # ── Convert to Markdown ───────────────────────────────────────
         if is_html:
             cleaned_html = _strip_boilerplate(resp.text)
             md_result = self._markitdown.convert_stream(
@@ -378,43 +470,69 @@ class SiteCrawler:
         md_path = _url_to_filepath(url, self.storage_dir)
         os.makedirs(os.path.dirname(md_path), exist_ok=True)
 
-        # Write .md file
-        with open(md_path, 'w', encoding='utf-8') as f:
-            f.write(md_text)
-
-        # Preview text (first ~300 chars)
+        # Preview text (first ~300 chars of body)
         preview = md_text[:300].strip()
         if len(md_text) > 300:
             preview += '…'
 
-        rel_path = os.path.relpath(md_path, self.storage_dir)
-        parsed = urlparse(url)
         now = datetime.datetime.utcnow()
 
-        # Persist to DB
+        # Read existing front-matter to preserve crawl_date on recrawl
+        old_meta = {}
+        if os.path.exists(md_path):
+            try:
+                with open(md_path, 'r', encoding='utf-8') as f:
+                    old_meta, _ = parse_frontmatter(f.read())
+            except Exception:
+                pass
+
+        crawl_date = old_meta.get('crawl_date', now.isoformat())
+
+        # Build front-matter
+        meta = {
+            'url': url,
+            'domain': domain,
+            'title': title or old_meta.get('title', ''),
+            'preview': preview,
+            'raw_hash': raw_hash,
+            'crawl_date': str(crawl_date),
+            'last_crawl_date': now.isoformat(),
+        }
+        frontmatter = build_frontmatter(meta)
+        full_md = frontmatter + md_text
+
+        # Write .md file
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write(full_md)
+
+        # Compute hash from the written .md file bytes
+        file_hash = _blake2b(full_md.encode('utf-8'))
+
+        rel_path = os.path.relpath(md_path, self.storage_dir)
+
+        # ── Persist to DB ─────────────────────────────────────────────
         with app.app_context():
             existing = db_models.WebPage.query.filter_by(url=url).first()
             if existing:
+                old_hash = existing.hash
                 existing.hash = file_hash
-                existing.hash_algorithm = self.HASH_ALGORITHM
-                existing.md_file_path = rel_path
-                existing.title = title or existing.title
-                existing.preview_text = preview
-                existing.last_crawl_date = now
+                existing.hash_algorithm = HASH_ALGORITHM
+                existing.file_path = rel_path
+                existing.raw_hash = raw_hash
+                # user_rating, model_rating, last_viewed are preserved
+                # Invalidate model_rating if content actually changed
+                if old_hash != file_hash:
+                    existing.model_rating = None
+                    existing.model_hash = None
                 db_models.db.session.commit()
                 page_id = existing.id
             else:
                 page = db_models.WebPage(
                     hash=file_hash,
-                    hash_algorithm=self.HASH_ALGORITHM,
+                    hash_algorithm=HASH_ALGORITHM,
+                    file_path=rel_path,
                     url=url,
-                    domain=domain,
-                    url_path=parsed.path,
-                    md_file_path=rel_path,
-                    title=title,
-                    preview_text=preview,
-                    crawl_date=now,
-                    last_crawl_date=now,
+                    raw_hash=raw_hash,
                 )
                 db_models.db.session.add(page)
                 db_models.db.session.commit()
@@ -424,8 +542,7 @@ class SiteCrawler:
             'id': page_id,
             'url': url,
             'title': title,
-            'md_file_path': rel_path,
-            'preview_text': preview,
+            'file_path': rel_path,
             'hash': file_hash,
             '_links': same_domain_links,
         }

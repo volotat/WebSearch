@@ -1,5 +1,34 @@
 # Web Search Module - Changelog
 
+### Version 0.1.3 (02.04.2026)
+*   **Architecture**
+    *   Metadata moved out of the database into `.md` file front-matter (hugo-style `---` blocks). Fields `domain`, `url_path`, `title`, `preview_text`, `crawl_date`, `last_crawl_date` are no longer DB columns — they are written and read from each file's YAML header. The DB schema now mirrors the text/music/images modules exactly.
+    *   Added `last_viewed` column (analogous to `last_played` in the music module). Updated on every rating change, page-content open, and external-link click.
+    *   Added `raw_hash` column — stores the BLAKE2b hash of the raw HTTP response bytes directly in the DB for fast recrawl change-detection without reading `.md` files from disk.
+    *   `url` column retained in the DB for fast recrawl matching.
+    *   `file_path` replaces `md_file_path` as the column name, consistent with other modules.
+*   **Crawler**
+    *   Front-matter support: `_fetch_and_store()` writes a YAML header (`url`, `domain`, `title`, `preview`, `raw_hash`, `crawl_date`, `last_crawl_date`) to each `.md` file. `parse_frontmatter()` / `build_frontmatter()` helpers handle reading and writing.
+    *   Hash source changed: the BLAKE2b hash stored in the DB is computed from the full `.md` file bytes (front-matter + body). `raw_hash` (hash of raw HTTP response) is stored both in the front-matter and in the DB column for fast recrawl comparison.
+    *   `.crawl.yaml` files: written progressively during crawling into every folder (and parent folders up to the domain root) as pages are saved. This ensures crawl metadata is preserved even if a crawl is interrupted, and allows recrawling any subfolder independently. Each file records `seed_url`, `sublinks_only`, `crawl_delay`, `max_pages`, and `last_crawl`.
+    *   Recrawl fast-path: compares `raw_hash` from the DB column directly instead of reading `.md` file front-matter, avoiding disk I/O for unchanged pages.
+    *   Recrawl preservation: `user_rating` and `last_viewed` are always retained; `model_rating` is invalidated only when page content has actually changed.
+    *   `crawl_date` is preserved from existing front-matter on recrawl so the original timestamp is not overwritten.
+*   **Backend**
+    *   `FileManager` integration: replaced the bespoke folder/file listing with `FileManager` (same class used by all other modules). `media_formats={'.md'}`, `db_schema=WebPage`.
+    *   `_WebSearchTextEngine` adapter: bridges `FileManager` / `CommonFilters` to WebSearch specifics — computes BLAKE2b hash from `.md` file bytes, reads front-matter from a two-level cache, provides semantic embedding via `TextEmbedder`.
+    *   `get_file_info()` callback reads `title`, `url`, `preview`, `crawl_date`, `last_viewed` from front-matter + DB, returning them as `file_info.*` fields in the standard `files_data` response format.
+    *   New `emit_WebSearch_recrawl_folder` handler: reads `.crawl.yaml` from the target folder and re-crawls using the stored parameters.
+    *   New `emit_WebSearch_mark_viewed` handler: updates `last_viewed` when the user clicks an external link.
+    *   `emit_WebSearch_set_rating` and `emit_WebSearch_get_page_content` now also update `last_viewed`.
+    *   Removed `emit_WebSearch_get_sites` and `emit_WebSearch_get_pages`; replaced by `emit_WebSearch_get_folders` and `emit_WebSearch_get_files` (FileManager-standard naming and response format).
+*   **Frontend**
+    *   Sidebar replaced: the domain list (`#ws_sites_list`) is removed. The sidebar now contains only the `+ Add page` button and a `FolderViewComponent` showing the full filesystem folder tree - selecting any folder shows pages from that folder and all subfolders.
+    *   Right-click on any folder shows a "↻ Recrawl folder" context menu option, opening a modal pre-populated from the folder's `.crawl.yaml`.
+    *   Fixed double context menu appearing on folder right-click (disabled `FolderViewComponent`'s built-in file-management menu, kept only the WebSearch-specific recrawl menu).
+    *   Card data now reads from `fileData.file_info.*` (FileManager response format) instead of flat page fields.
+    *   External-link clicks emit `emit_WebSearch_mark_viewed` to update `last_viewed`.
+
 ### Version 0.1.2 (21.03.2026)
 *   **Search & Filtering**
     *   Search bar integration: replaced the static order buttons with `SearchBarComponent` (shared with text/images/music/video modules). Supports fuzzy title/URL search (`file-name` mode) and semantic content search (`semantic-content` mode), plus keyword shortcuts: `rating`, `recommendation`, `recent`.

@@ -6,9 +6,8 @@ import SearchBarComponent from '/modules/SearchBarComponent.js';
 // ── State (initialised from URL on every page load) ────────────────────
 const PAGE_LIMIT = 14;
 const _urlParams = new URLSearchParams(window.location.search);
-let currentPage   = parseInt(_urlParams.get('page'))   || 1;
-let currentDomain = _urlParams.get('domain')           || null;
-let currentPath   = decodeURIComponent(_urlParams.get('path') || '');
+let currentPage = parseInt(_urlParams.get('page')) || 1;
+let currentPath = decodeURIComponent(_urlParams.get('path') || '');
 let searchState = {
   text_query:  decodeURIComponent(_urlParams.get('text_query') || ''),
   mode:        _urlParams.get('mode')        || 'file-name',
@@ -16,12 +15,17 @@ let searchState = {
   temperature: parseFloat(_urlParams.get('temperature')) || 0,
   seed:        _urlParams.get('seed')        || null,
 };
+
 // Add-page modal state
 let _addModalRating = null;
 let _addModalStarInstance = null;
 
+// Recrawl modal state
+let _recrawlIsBulk = false;
+
 // Shared context menu instance
 const _contextMenu = new ContextMenuComponent();
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 function truncate(str, max = 120) {
@@ -30,12 +34,29 @@ function truncate(str, max = 120) {
 }
 
 /**
- * Build a single wide card element for a WebPage record.
+ * Navigate to the current page with updated URL params.
  */
-function buildCard(page) {
+function _navigateTo(updates) {
+  const p = new URLSearchParams(window.location.search);
+  for (const [k, v] of Object.entries(updates)) {
+    if (v === null || v === undefined || v === '') {
+      p.delete(k);
+    } else {
+      p.set(k, String(v));
+    }
+  }
+  window.location.search = p.toString();
+}
+
+/**
+ * Build a single wide card element for a file entry returned by FileManager.
+ * fileData = { file_path, hash, base_name, file_size, file_info: {…} }
+ */
+function buildCard(fileData) {
+  const info = fileData.file_info || {};
   const card = document.createElement('div');
   card.className = 'ws-card';
-  card.dataset.pageId = page.id;
+  card.dataset.filePath = fileData.file_path;
 
   // ── Body (title + url + preview) ──────────────────────────────────
   const body = document.createElement('div');
@@ -47,29 +68,37 @@ function buildCard(page) {
   titleEl.style.whiteSpace = 'normal';
   const titleLink = document.createElement('a');
   titleLink.href = '#';
-  titleLink.textContent = page.title || page.url;
+  titleLink.textContent = info.title || fileData.base_name || fileData.file_path;
   titleLink.addEventListener('click', (e) => {
     e.preventDefault();
-    openPageModal(page);
+    openPageModal(fileData);
   });
   titleEl.appendChild(titleLink);
   body.appendChild(titleEl);
 
   // URL (opens actual page in new tab)
-  const urlEl = document.createElement('div');
-  urlEl.className = 'ws-card-url';
-  const urlLink = document.createElement('a');
-  urlLink.href = page.url;
-  urlLink.target = '_blank';
-  urlLink.rel = 'noopener';
-  urlLink.textContent = page.url;
-  urlEl.appendChild(urlLink);
-  body.appendChild(urlEl);
+  if (info.url) {
+    const urlEl = document.createElement('div');
+    urlEl.className = 'ws-card-url';
+    const urlLink = document.createElement('a');
+    urlLink.href = info.url;
+    urlLink.target = '_blank';
+    urlLink.rel = 'noopener';
+    urlLink.textContent = info.url;
+    urlLink.addEventListener('click', () => {
+      // Mark as viewed
+      if (fileData.hash) {
+        socket.emit('emit_WebSearch_mark_viewed', { hash: fileData.hash });
+      }
+    });
+    urlEl.appendChild(urlLink);
+    body.appendChild(urlEl);
+  }
 
   // Preview text
   const previewEl = document.createElement('div');
   previewEl.className = 'ws-card-preview';
-  previewEl.textContent = page.preview_text || '';
+  previewEl.textContent = info.preview_text || '';
   body.appendChild(previewEl);
 
   card.appendChild(body);
@@ -78,18 +107,19 @@ function buildCard(page) {
   const ratingWrap = document.createElement('div');
   ratingWrap.className = 'ws-card-rating';
 
-  const hasUserRating = page.user_rating !== null && page.user_rating !== undefined;
-  const displayRating = hasUserRating ? page.user_rating : page.model_rating;
+  const hasUserRating = info.user_rating !== null && info.user_rating !== undefined;
+  const displayRating = hasUserRating ? info.user_rating : info.model_rating;
 
   const starRating = new StarRatingComponent({
     initialRating: displayRating,
     callback: (rating) => {
       socket.emit('emit_WebSearch_set_rating', {
-        page_id: page.id,
+        hash: fileData.hash,
+        file_path: fileData.file_path,
         rating: rating,
       }, (resp) => {
         if (resp && !resp.error) {
-          page.user_rating = rating;
+          info.user_rating = rating;
           starRating.isUserRated = true;
           starRating.updateAllContainers();
         }
@@ -143,88 +173,48 @@ function renderPagination(page, total, limit) {
   }
 }
 
-// ── URL navigation helper ───────────────────────────────────────────────
-
-/**
- * Navigate to the current page with updated URL params.
- * Null/empty values are removed from the URL; others are set.
- */
-function _navigateTo(updates) {
-  const p = new URLSearchParams(window.location.search);
-  for (const [k, v] of Object.entries(updates)) {
-    if (v === null || v === undefined || v === '') {
-      p.delete(k);
-    } else {
-      p.set(k, String(v));
-    }
-  }
-  window.location.search = p.toString();
-}
-
 // ── Data fetching ────────────────────────────────────────────────────────
 
-function fetchPages() {
+function fetchFiles() {
   const payload = {
     page: currentPage,
     limit: PAGE_LIMIT,
+    pagination: (currentPage - 1) * PAGE_LIMIT,
     text_query:  searchState.text_query,
     mode:        searchState.mode,
     order:       searchState.order,
     temperature: searchState.temperature,
     seed:        searchState.seed,
   };
-  if (currentDomain) payload.domain = currentDomain;
   if (currentPath) payload.path = currentPath;
 
-  socket.emit('emit_WebSearch_get_pages', payload, (response) => {
+  socket.emit('emit_WebSearch_get_files', payload, (response) => {
     const container = document.getElementById('ws_pages_container');
     container.innerHTML = '';
 
-    if (!response || !response.pages) return;
+    if (!response || !response.files_data) return;
 
-    response.pages.forEach((page) => {
-      container.appendChild(buildCard(page));
+    response.files_data.forEach((fileData) => {
+      container.appendChild(buildCard(fileData));
     });
 
-    renderPagination(response.page, response.total, response.limit);
+    const total = response.total_files || 0;
+    renderPagination(currentPage, total, PAGE_LIMIT);
     document.querySelector('.search-status').textContent =
-      `${response.total} page${response.total !== 1 ? 's' : ''}`;
+      `${total} page${total !== 1 ? 's' : ''}`;
   });
 }
 
-function fetchSites() {
-  socket.emit('emit_WebSearch_get_sites', {}, (sites) => {
-    const list = document.getElementById('ws_sites_list');
+function fetchFolders() {
+  socket.emit('emit_WebSearch_get_folders', { path: currentPath }, (response) => {
+    const treeContainer = document.getElementById('ws_folder_tree');
+    treeContainer.innerHTML = '';
 
-    // Keep the "All Sites" entry — mark active if no domain is selected
-    const allActive = !currentDomain ? ' is-active' : '';
-    list.innerHTML = `<li><a class="ws-site-item${allActive}" data-site-id="">All Sites</a></li>`;
+    if (!response || !response.folders) return;
 
-    if (!sites) return;
-
-    sites.forEach((site) => {
-      const li = document.createElement('li');
-      const a = document.createElement('a');
-      a.className = 'ws-site-item' + (site.domain === currentDomain ? ' is-active' : '');
-      a.dataset.domain = site.domain;
-      const status = site.crawl_status === 'crawling' ? ' ⧗' : '';
-      a.innerHTML = `${site.domain}${status} <span class="ws-site-count">[${site.pages}]</span>`;
-      // Right-click context menu
-      a.addEventListener('contextmenu', (e) => {
-        e.preventDefault();
-        _contextMenu.show(e.pageX, e.pageY, [
-          {
-            label: '&#x21BB; Recrawl site',
-            action: () => openRecrawlModal(site.domain),
-          },
-        ]);
-      });
-      li.appendChild(a);
-      list.appendChild(li);
-    });
-
-    // Re-bind click handlers
-    bindSiteClicks();
+    const folderView = new FolderViewComponent(response.folders, response.folder_path || currentPath, false);
+    treeContainer.appendChild(folderView.getDOMElement());
+    _bindFolderTreeClicks();
   });
 }
 
@@ -244,66 +234,56 @@ function _bindFolderTreeClicks() {
     const params = new URLSearchParams(href.replace(/^\?/, ''));
     const clickedPath = params.get('path') || '';
 
-    // Toggle: if clicking the already-active folder, go back to site root
+    // Toggle: if clicking the already-active folder, go back to root
     const newPath = (currentPath === clickedPath) ? '' : clickedPath;
     _navigateTo({ path: newPath || null, page: 1 });
   });
-}
 
-function fetchFolders() {
-  const treeContainer = document.getElementById('ws_folder_tree');
-  if (!currentDomain) {
-    treeContainer.innerHTML = '';
-    return;
-  }
+  // Right-click on folder links → recrawl option
+  document.getElementById('ws_folder_tree').addEventListener('contextmenu', (e) => {
+    const link = e.target.closest('a');
+    if (!link) return;
+    e.preventDefault();
 
-  const payload = { domain: currentDomain };
+    const href = link.getAttribute('href') || '';
+    const params = new URLSearchParams(href.replace(/^\?/, ''));
+    const folderPath = params.get('path') || '';
 
-  socket.emit('emit_WebSearch_get_folders', payload, (foldersDict) => {
-    treeContainer.innerHTML = '';
-
-    if (!foldersDict || foldersDict.total_files === 0) return;
-
-    const folderView = new FolderViewComponent(foldersDict, currentPath);
-    treeContainer.appendChild(folderView.getDOMElement());
-    _bindFolderTreeClicks();
-  });
-}
-
-function bindSiteClicks() {
-  document.querySelectorAll('.ws-site-item').forEach((el) => {
-    el.addEventListener('click', (e) => {
-      e.preventDefault();
-      const domain = el.dataset.domain || null;
-      _navigateTo({ domain, path: null, page: 1 });
-    });
+    _contextMenu.show(e.pageX, e.pageY, [
+      {
+        label: '&#x21BB; Recrawl folder',
+        action: () => openRecrawlModal(folderPath),
+      },
+    ]);
   });
 }
 
 // ── Modal ────────────────────────────────────────────────────────────────
 
-function openPageModal(page) {
+function openPageModal(fileData) {
+  const info = fileData.file_info || {};
   const modal = document.getElementById('ws_page_modal');
-  document.getElementById('ws_modal_title').textContent = page.title || page.url;
-  document.getElementById('ws_modal_link').href = page.url;
+  document.getElementById('ws_modal_title').textContent = info.title || fileData.base_name || fileData.file_path;
+  document.getElementById('ws_modal_link').href = info.url || '#';
   document.getElementById('ws_modal_body').innerHTML = 'Loading…';
 
   // Star rating in modal
   const ratingContainer = document.getElementById('ws_modal_rating');
   ratingContainer.innerHTML = '';
 
-  const hasUserRating = page.user_rating !== null && page.user_rating !== undefined;
-  const displayRating = hasUserRating ? page.user_rating : page.model_rating;
+  const hasUserRating = info.user_rating !== null && info.user_rating !== undefined;
+  const displayRating = hasUserRating ? info.user_rating : info.model_rating;
 
   const modalStarRating = new StarRatingComponent({
     initialRating: displayRating,
     callback: (rating) => {
       socket.emit('emit_WebSearch_set_rating', {
-        page_id: page.id,
+        hash: fileData.hash,
+        file_path: fileData.file_path,
         rating: rating,
       }, (resp) => {
         if (resp && !resp.error) {
-          page.user_rating = rating;
+          info.user_rating = rating;
           modalStarRating.isUserRated = true;
           modalStarRating.updateAllContainers();
         }
@@ -322,7 +302,7 @@ function openPageModal(page) {
   modal.classList.add('is-active');
 
   // Fetch markdown content
-  socket.emit('emit_WebSearch_get_page_content', { page_id: page.id }, (resp) => {
+  socket.emit('emit_WebSearch_get_page_content', { file_path: fileData.file_path }, (resp) => {
     if (resp && resp.content) {
       marked.setOptions({ breaks: true, gfm: true });
       const html = DOMPurify.sanitize(marked.parse(resp.content));
@@ -333,15 +313,41 @@ function openPageModal(page) {
   });
 }
 
-// ── Recrawl modal ───────────────────────────────────────────────────────────────────
+// ── Recrawl modal (folder-based) ────────────────────────────────────────────────
 
-function openRecrawlModal(domain) {
-  document.getElementById('ws_recrawl_url').value = `https://${domain}`;
+function openRecrawlModal(folderPath) {
+  _recrawlIsBulk = false;
+  document.getElementById('ws_recrawl_folder').value = folderPath || '/';
+  document.getElementById('ws_recrawl_url').value = '';
   document.getElementById('ws_recrawl_sublinks_cb').checked = false;
   document.getElementById('ws_recrawl_delay_input').value = '0.5';
-  document.getElementById('ws_recrawl_max_pages_input').value = '5000';
+  document.getElementById('ws_recrawl_max_pages_input').value = '300';
+  document.getElementById('ws_recrawl_bulk_notice').style.display = 'none';
+  document.getElementById('ws_recrawl_single_fields').style.display = '';
+
   document.getElementById('ws_recrawl_modal').classList.add('is-active');
-  setTimeout(() => document.getElementById('ws_recrawl_url').focus(), 50);
+
+  // Pre-populate from .crawl.yaml stored in the folder
+  socket.emit('emit_WebSearch_read_crawl_yaml', { path: folderPath }, (conf) => {
+    if (!conf) return;
+
+    if (conf.mode === 'bulk') {
+      // Top-level folder with multiple sub-sites — switch to bulk mode
+      _recrawlIsBulk = true;
+      document.getElementById('ws_recrawl_single_fields').style.display = 'none';
+      const notice = document.getElementById('ws_recrawl_bulk_notice');
+      notice.style.display = '';
+      const ul = document.getElementById('ws_recrawl_bulk_sites');
+      ul.innerHTML = (conf.sites || []).map(s => `<li>${s}</li>`).join('');
+      return;
+    }
+
+    if (conf.seed_url) document.getElementById('ws_recrawl_url').value = conf.seed_url;
+    if (conf.sublinks_only !== undefined) document.getElementById('ws_recrawl_sublinks_cb').checked = !!conf.sublinks_only;
+    if (conf.crawl_delay !== undefined) document.getElementById('ws_recrawl_delay_input').value = conf.crawl_delay;
+    if (conf.max_pages !== undefined) document.getElementById('ws_recrawl_max_pages_input').value = conf.max_pages;
+    setTimeout(() => document.getElementById('ws_recrawl_url').focus(), 50);
+  });
 }
 
 function closeRecrawlModal() {
@@ -349,20 +355,21 @@ function closeRecrawlModal() {
 }
 
 function confirmRecrawlModal() {
-  const url = document.getElementById('ws_recrawl_url').value.trim();
-  if (!url) {
-    document.getElementById('ws_recrawl_url').focus();
-    return;
-  }
-  const sublinksOnly = document.getElementById('ws_recrawl_sublinks_cb').checked;
+  const folderPath = document.getElementById('ws_recrawl_folder').value.trim();
   const crawlDelay = parseFloat(document.getElementById('ws_recrawl_delay_input').value) || 0.5;
-  const maxPages = parseInt(document.getElementById('ws_recrawl_max_pages_input').value, 10) || 5000;
+  const maxPages = parseInt(document.getElementById('ws_recrawl_max_pages_input').value, 10) || 300;
   closeRecrawlModal();
-  socket.emit('emit_WebSearch_recrawl_site', {
-    url,
-    sublinks_only: sublinksOnly,
-    crawl_delay: crawlDelay,
-    max_pages: maxPages,
+
+  const payload = { path: folderPath, crawl_delay: crawlDelay, max_pages: maxPages };
+  if (!_recrawlIsBulk) {
+    payload.url = document.getElementById('ws_recrawl_url').value.trim();
+    payload.sublinks_only = document.getElementById('ws_recrawl_sublinks_cb').checked;
+  }
+
+  socket.emit('emit_WebSearch_recrawl_folder', payload, (resp) => {
+    if (resp && resp.error) {
+      alert('Recrawl error: ' + resp.error);
+    }
   });
 }
 
@@ -393,7 +400,6 @@ function openAddModal() {
   });
   const starEl = _addModalStarInstance.issueNewHtmlComponent({
     containerType: 'span',
-    // size: 26,
     isActive: true,
   });
   ratingContainer.appendChild(starEl);
@@ -436,8 +442,8 @@ function confirmAddModal() {
 
 $(document).ready(function () {
   // Fetch initial data
-  fetchSites();
-  fetchPages();
+  fetchFolders();
+  fetchFiles();
 
   // ── Recrawl modal controls ────────────────────────────────────────────
   document.querySelectorAll('.ws-recrawl-modal-close').forEach((el) => {
@@ -445,9 +451,6 @@ $(document).ready(function () {
   });
   document.getElementById('ws_recrawl_modal_confirm').addEventListener('click', confirmRecrawlModal);
   document.getElementById('ws_recrawl_modal_cancel').addEventListener('click', closeRecrawlModal);
-  document.getElementById('ws_recrawl_url').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') confirmRecrawlModal();
-  });
 
   // ── Add page button → opens modal ────────────────────────────────
   document.getElementById('ws_add_page_btn').addEventListener('click', openAddModal);
@@ -476,9 +479,6 @@ $(document).ready(function () {
   });
 
   // ── Search bar ────────────────────────────────────────────────────
-  // autoSyncUrl + ensureDefaultsInUrl: any search/mode/order/temp change
-  // rewrites the URL and reloads the page, matching the pattern used by
-  // the text, images, music and videos modules.
   const _searchBar = new SearchBarComponent({
     container: document.getElementById('ws_search_bar'),
     enableModes: ['file-name', 'semantic-content'],
@@ -487,7 +487,7 @@ $(document).ready(function () {
     temperatures: [0, 0.2, 1, 2],
     keywords: ['rating', 'recommendation', 'recent'],
     autoSyncUrl: true,
-    ensureDefaultsInUrl: true
+    ensureDefaultsInUrl: true,
   });
   // Sync searchState from the component (which has already read/normalised URL params)
   Object.assign(searchState, _searchBar.getState());
@@ -502,20 +502,18 @@ $(document).ready(function () {
   });
 
   // ── Live events from server ───────────────────────────────────────
-  socket.on('emit_WebSearch_page_added', (_page) => {
-    fetchSites();
+  socket.on('emit_WebSearch_page_added', () => {
     fetchFolders();
-    fetchPages();
+    fetchFiles();
   });
 
   socket.on('emit_WebSearch_crawl_progress', (data) => {
     document.getElementById('ws_crawl_status').textContent = data.message || '';
   });
 
-  socket.on('emit_WebSearch_show_sites', (_sites) => {
-    fetchSites();
+  socket.on('emit_WebSearch_crawl_done', () => {
     fetchFolders();
-    fetchPages();
+    fetchFiles();
   });
 
   socket.on('emit_show_search_status', (status) => {
