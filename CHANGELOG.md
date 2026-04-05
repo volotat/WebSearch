@@ -1,6 +1,12 @@
 # Web Search Module - Changelog
 
-### Version 0.1.3 (02.04.2026)
+### Version 0.3.10.0 [for Anagnorisis > 0.3.10] (05.04.2026)
+*   **Background Processing via Task Manager:**
+    *   All long-running operations (add page, crawl site, bulk recrawl, single-folder recrawl, score unscored pages, restore missing Markdown files) are now submitted to the centralised `TaskManager` queue (`app.task_manager.submit()`) instead of being launched as bare `threading.Thread` daemon threads.
+    *   Each task receives a `TaskContext` and calls `ctx.check()` / `ctx.update()` for cooperative pause, cancel, and live progress reporting.
+    *   Crawl progress is no longer written to the global search-status bar (`show_search_status`); it is reported exclusively through the Task Manager modal visible on all pages.
+
+### Version 0.3.7.3 [for Anagnorisis > 0.3.7]  (02.04.2026)
 *   **Architecture**
     *   Metadata moved out of the database into `.md` file front-matter (hugo-style `---` blocks). Fields `domain`, `url_path`, `title`, `preview_text`, `crawl_date`, `last_crawl_date` are no longer DB columns — they are written and read from each file's YAML header. The DB schema now mirrors the text/music/images modules exactly.
     *   Added `last_viewed` column (analogous to `last_played` in the music module). Updated on every rating change, page-content open, and external-link click.
@@ -29,7 +35,7 @@
     *   Card data now reads from `fileData.file_info.*` (FileManager response format) instead of flat page fields.
     *   External-link clicks emit `emit_WebSearch_mark_viewed` to update `last_viewed`.
 
-### Version 0.1.2 (21.03.2026)
+### Version 0.3.7.2 [for Anagnorisis > 0.3.7] (21.03.2026)
 *   **Search & Filtering**
     *   Search bar integration: replaced the static order buttons with `SearchBarComponent` (shared with text/images/music/video modules). Supports fuzzy title/URL search (`file-name` mode) and semantic content search (`semantic-content` mode), plus keyword shortcuts: `rating`, `recommendation`, `recent`.
     *   URL-driven navigation: switched from SPA-style socket-on-demand to the same URL-reload pattern used by all other modules (`autoSyncUrl: true`, `ensureDefaultsInUrl: true`). Search mode, order, temperature, seed, page, domain, and folder path are all persisted in the URL — browser back/forward and bookmarks work correctly. Pagination links are real `href` URLs; site and folder clicks call `_navigateTo()` to rewrite the URL and reload.
@@ -42,7 +48,7 @@
 *   **Reliability**
     *   Automatic `.md` file restoration: a `_restore_missing_md_files()` background daemon thread runs at every startup. It compares `md_file_path` values in the DB against the filesystem and silently re-crawls any URL whose file is missing. Unreachable URLs are skipped gracefully (DB record retained).
 
-### Version 0.1.1 (14.03.2026)
+### Version 0.3.7.1 [for Anagnorisis > 0.3.7] (14.03.2026)
 *   **Crawler**
     *   Incremental Recrawl: `SiteCrawler.crawl_site()` gains a `recrawl` parameter. When `True`, the raw HTTP response bytes are hashed (BLAKE2b) immediately after fetching, before markitdown is ever invoked. If the hash matches the stored value the page is skipped entirely — but its links are still extracted from the freshly-fetched HTML so index/listing pages (e.g. `/articles`, `/r/LocalLLaMA/`) can still surface new content.
     *   BLAKE2b hashing: Replaced MD5-of-markdown content hashing with BLAKE2b-128 (`hashlib.blake2b(digest_size=16)`) of raw HTTP response bytes (`blake2b:v1`). Hashing raw bytes is faster (no markitdown needed for the comparison), and BLAKE2b is significantly faster than MD5. `hash_algorithm` column is updated on every write so old `md5:v1` rows are transparently upgraded on next crawl.
@@ -63,7 +69,7 @@
     *   Add Page Modal: Modal contains: a URL input field; an optional `StarRatingComponent` so the user can rate the page at add time; a "Start crawling website from this page" checkbox; a "Crawl only sublinks" checkbox (disabled until crawling is enabled) that restricts BFS to pages whose URL path starts with the seed URL's path (e.g. a specific subreddit); a configurable crawl-delay number input (disabled until crawling is enabled, default 0.5 s, with a hint to use ≥ 3 s for rate-limited sites like Reddit); a "Max pages to crawl" number input (disabled until crawling is enabled, default 5000); Confirm and Cancel buttons.
     *   Add Page Modal: An optional user rating supplied in the modal is persisted immediately after the page is fetched (`emit_WebSearch_add_page`) or applied to the seed URL after a crawl completes (`emit_WebSearch_crawl_site`).
     
-### Version 0.1.0 (10.03.2026)
+### Version 0.3.7.0 [for Anagnorisis > 0.3.7] (10.03.2026)
 Initial implementation.
 *   **Core Crawler:**
     *   `crawler.py` - `SiteCrawler` class with two entry points: `crawl_single_page()` (fetch one URL) and `crawl_site()` (BFS, same-domain only, configurable page limit).

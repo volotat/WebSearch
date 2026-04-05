@@ -234,8 +234,9 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
 
     # ── Crawler instance ─────────────────────────────────────────────────
     def _crawl_status(msg):
+        # Only update the WebSearch page's own crawl-status label.
+        # Background progress is shown in the Task Manager modal instead.
         socketio.emit('emit_WebSearch_crawl_progress', {'message': msg})
-        common_socket_events.show_search_status(msg)
 
     crawler = SiteCrawler(
         storage_dir=storage_dir,
@@ -243,6 +244,9 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         max_pages=max_pages_per_site,
         status_callback=_crawl_status,
     )
+
+    # ── Task manager reference ───────────────────────────────────────────
+    task_manager = app.task_manager
 
     # ── Scoring state ────────────────────────────────────────────────────
     _scoring_state = {'last_hash': None, 'in_progress': False}
@@ -280,35 +284,31 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
                 page.model_hash = evaluator.hash
                 db_models.db.session.commit()
 
-    def _bulk_score_unscored():
-        if _scoring_state['in_progress']:
-            return
-        _scoring_state['in_progress'] = True
+    def _task_score_pages(ctx):
+        """Task: score all unscored / stale pages in the DB."""
         current_hash = evaluator.hash
         try:
-            with app.app_context():
-                pages = db_models.WebPage.query.filter(
-                    (db_models.WebPage.model_rating.is_(None)) |
-                    (db_models.WebPage.model_hash != current_hash)
-                ).all()
-                total = len(pages)
-                if total == 0:
-                    _scoring_state['last_hash'] = current_hash
-                    return
-                print(f"[WebSearch] Re-scoring {total} pages with evaluator {current_hash}…")
-                for i, page in enumerate(pages):
-                    if page.file_path is None:
-                        continue
-                    rating = _score_page(page.file_path)
-                    if rating is not None:
-                        page.model_rating = rating
-                        page.model_hash = current_hash
-                    common_socket_events.show_search_status(
-                        f"[WebSearch] Scoring pages… {i + 1}/{total}"
-                    )
-                db_models.db.session.commit()
-                print(f"[WebSearch] Scoring complete ({total} pages).")
+            pages = db_models.WebPage.query.filter(
+                (db_models.WebPage.model_rating.is_(None)) |
+                (db_models.WebPage.model_hash != current_hash)
+            ).all()
+            total = len(pages)
+            if total == 0:
                 _scoring_state['last_hash'] = current_hash
+                return
+            print(f"[WebSearch] Re-scoring {total} pages with evaluator {current_hash}…")
+            for i, page in enumerate(pages):
+                ctx.check()
+                ctx.update((i + 1) / total, f"Scoring page {i + 1}/{total}…")
+                if page.file_path is None:
+                    continue
+                rating = _score_page(page.file_path)
+                if rating is not None:
+                    page.model_rating = rating
+                    page.model_hash = current_hash
+            db_models.db.session.commit()
+            print(f"[WebSearch] Scoring complete ({total} pages).")
+            _scoring_state['last_hash'] = current_hash
         finally:
             _scoring_state['in_progress'] = False
 
@@ -318,8 +318,8 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         if evaluator.hash is None:
             return
         if _scoring_state['last_hash'] != evaluator.hash:
-            thread = threading.Thread(target=_bulk_score_unscored, daemon=True)
-            thread.start()
+            _scoring_state['in_progress'] = True
+            task_manager.submit('WebSearch: score unscored pages', _task_score_pages)
 
     def _touch_last_viewed(page):
         """Update last_viewed timestamp on a WebPage."""
@@ -336,22 +336,25 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
             return {'error': 'No URL provided'}
         user_rating = data.get('user_rating', None)
 
-        def _do_add():
-            with app.app_context():
-                page_info = crawler.crawl_single_page(url, app=app)
-                if page_info:
-                    _score_and_update(page_info['id'])
-                    if user_rating is not None:
-                        page = db_models.WebPage.query.get(page_info['id'])
-                        if page:
-                            page.user_rating = float(user_rating)
-                            page.user_rating_date = datetime.datetime.utcnow()
-                            db_models.db.session.commit()
+        def _task_add(ctx):
+            ctx.update(0.1, f'Crawling {url}…')
+            ctx.check()
+            page_info = crawler.crawl_single_page(url, app=app)
+            if page_info:
+                ctx.check()
+                ctx.update(0.5, 'Scoring page…')
+                _score_and_update(page_info['id'])
+                if user_rating is not None:
                     page = db_models.WebPage.query.get(page_info['id'])
-                    socketio.emit('emit_WebSearch_page_added', page.as_dict() if page else page_info)
+                    if page:
+                        page.user_rating = float(user_rating)
+                        page.user_rating_date = datetime.datetime.utcnow()
+                        db_models.db.session.commit()
+                page = db_models.WebPage.query.get(page_info['id'])
+                socketio.emit('emit_WebSearch_page_added', page.as_dict() if page else page_info)
+            ctx.update(1.0, 'Done')
 
-        thread = threading.Thread(target=_do_add, daemon=True)
-        thread.start()
+        task_manager.submit(f'Add page: {url}', _task_add)
 
     @socketio.on('emit_WebSearch_crawl_site')
     def handle_crawl_site(data):
@@ -364,28 +367,37 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         sublinks_only = bool(data.get('sublinks_only', False))
         seed_user_rating = data.get('seed_user_rating', None)
 
-        def _do_crawl():
+        def _task_crawl(ctx):
+            pages_done = [0]
+
+            def _ctx_status(msg):
+                pages_done[0] += 1
+                ctx.check()
+                ctx.update(min(0.9, pages_done[0] / max(max_pages, 1)), msg)
+                _crawl_status(msg)
+
             site_crawler = SiteCrawler(
                 storage_dir=storage_dir,
                 crawl_delay=float(custom_delay) if custom_delay is not None else crawl_delay,
                 max_pages=max_pages,
-                status_callback=_crawl_status,
+                status_callback=_ctx_status,
             )
-            with app.app_context():
-                results = site_crawler.crawl_site(url, app=app, sublinks_only=sublinks_only)
-                if seed_user_rating is not None:
-                    seed_page = db_models.WebPage.query.filter_by(url=url).first()
-                    if seed_page:
-                        seed_page.user_rating = float(seed_user_rating)
-                        seed_page.user_rating_date = datetime.datetime.utcnow()
-                        db_models.db.session.commit()
-                for info in results:
-                    _score_and_update(info['id'])
-                _crawl_status(f"Scoring complete – {len(results)} pages crawled.")
+            results = site_crawler.crawl_site(url, app=app, sublinks_only=sublinks_only)
+            if seed_user_rating is not None:
+                seed_page = db_models.WebPage.query.filter_by(url=url).first()
+                if seed_page:
+                    seed_page.user_rating = float(seed_user_rating)
+                    seed_page.user_rating_date = datetime.datetime.utcnow()
+                    db_models.db.session.commit()
+            for i, info in enumerate(results):
+                ctx.check()
+                ctx.update(0.9 + 0.1 * (i + 1) / max(len(results), 1),
+                           f'Scoring page {i + 1}/{len(results)}…')
+                _score_and_update(info['id'])
+            ctx.update(1.0, f'Done – {len(results)} pages crawled')
             socketio.emit('emit_WebSearch_crawl_done', {})
 
-        thread = threading.Thread(target=_do_crawl, daemon=True)
-        thread.start()
+        task_manager.submit(f'Crawl site: {url}', _task_crawl)
 
     @socketio.on('emit_WebSearch_recrawl_folder')
     def handle_recrawl_folder(data):
@@ -407,70 +419,83 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         seed_url = url_override or crawl_conf.get('seed_url', '')
         if not seed_url:
             # Bulk mode: recrawl each immediate sub-folder that has a .crawl.yaml
-            def _do_bulk_recrawl():
+            def _task_bulk_recrawl(ctx):
                 total = 0
                 try:
                     entries = sorted(os.scandir(abs_folder), key=lambda e: e.name)
                 except OSError:
                     entries = []
-                with app.app_context():
-                    for entry in entries:
-                        if not entry.is_dir():
-                            continue
-                        sub_conf = read_crawl_yaml(entry.path)
-                        if not sub_conf or not sub_conf.get('seed_url'):
-                            continue
-                        sub_seed = sub_conf['seed_url']
-                        sub_sublinks = sub_conf.get('sublinks_only', False)
-                        sub_delay = (
-                            float(custom_delay) if custom_delay is not None
-                            else sub_conf.get('crawl_delay', crawl_delay)
-                        )
-                        sub_max = max_pages or sub_conf.get('max_pages', max_pages_per_site)
-                        _crawl_status(f'Recrawling {sub_seed} …')
-                        site_crawler = SiteCrawler(
-                            storage_dir=storage_dir,
-                            crawl_delay=sub_delay,
-                            max_pages=sub_max,
-                            status_callback=_crawl_status,
-                        )
-                        changed = site_crawler.crawl_site(
-                            sub_seed, app=app, sublinks_only=sub_sublinks, recrawl=True
-                        )
-                        for info in changed:
-                            _score_and_update(info['id'])
-                        total += len(changed)
+                for entry in entries:
+                    ctx.check()
+                    if not entry.is_dir():
+                        continue
+                    sub_conf = read_crawl_yaml(entry.path)
+                    if not sub_conf or not sub_conf.get('seed_url'):
+                        continue
+                    sub_seed = sub_conf['seed_url']
+                    sub_sublinks = sub_conf.get('sublinks_only', False)
+                    sub_delay = (
+                        float(custom_delay) if custom_delay is not None
+                        else sub_conf.get('crawl_delay', crawl_delay)
+                    )
+                    sub_max = max_pages or sub_conf.get('max_pages', max_pages_per_site)
+                    ctx.update(0.0, f'Recrawling {sub_seed}…')
+                    _crawl_status(f'Recrawling {sub_seed} …')
+
+                    def _sub_status(msg):
+                        ctx.check()
+                        _crawl_status(msg)
+
+                    site_crawler = SiteCrawler(
+                        storage_dir=storage_dir,
+                        crawl_delay=sub_delay,
+                        max_pages=sub_max,
+                        status_callback=_sub_status,
+                    )
+                    changed = site_crawler.crawl_site(
+                        sub_seed, app=app, sublinks_only=sub_sublinks, recrawl=True
+                    )
+                    for info in changed:
+                        ctx.check()
+                        _score_and_update(info['id'])
+                    total += len(changed)
                 _crawl_status(f'Bulk recrawl complete – {total} pages updated.')
                 socketio.emit('emit_WebSearch_crawl_done', {})
 
-            thread = threading.Thread(target=_do_bulk_recrawl, daemon=True)
-            thread.start()
+            task_manager.submit(f'Bulk recrawl: {folder_path or "/"}', _task_bulk_recrawl)
             return
 
         sublinks_only = data.get('sublinks_only', crawl_conf.get('sublinks_only', False))
         delay = float(custom_delay) if custom_delay is not None else crawl_conf.get('crawl_delay', crawl_delay)
         max_p = max_pages or crawl_conf.get('max_pages', max_pages_per_site)
 
-        def _do_recrawl():
+        def _task_recrawl(ctx):
+            pages_done = [0]
+
+            def _ctx_status(msg):
+                pages_done[0] += 1
+                ctx.check()
+                ctx.update(min(0.9, pages_done[0] / max(max_p, 1)), msg)
+                _crawl_status(msg)
+
             site_crawler = SiteCrawler(
                 storage_dir=storage_dir,
                 crawl_delay=delay,
                 max_pages=max_p,
-                status_callback=_crawl_status,
+                status_callback=_ctx_status,
             )
-            with app.app_context():
-                changed = site_crawler.crawl_site(
-                    seed_url, app=app, sublinks_only=sublinks_only, recrawl=True
-                )
-                for info in changed:
-                    _score_and_update(info['id'])
-                _crawl_status(
-                    f"Recrawl complete – {len(changed)} pages updated."
-                )
+            changed = site_crawler.crawl_site(
+                seed_url, app=app, sublinks_only=sublinks_only, recrawl=True
+            )
+            for i, info in enumerate(changed):
+                ctx.check()
+                ctx.update(0.9 + 0.1 * (i + 1) / max(len(changed), 1),
+                           f'Scoring page {i + 1}/{len(changed)}…')
+                _score_and_update(info['id'])
+            ctx.update(1.0, f'Recrawl done – {len(changed)} pages updated')
             socketio.emit('emit_WebSearch_crawl_done', {})
 
-        thread = threading.Thread(target=_do_recrawl, daemon=True)
-        thread.start()
+        task_manager.submit(f'Recrawl: {seed_url}', _task_recrawl)
 
     @socketio.on('emit_WebSearch_read_crawl_yaml')
     def handle_read_crawl_yaml(data):
@@ -670,41 +695,33 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
             if page:
                 _touch_last_viewed(page)
 
-    def _restore_missing_md_files():
-        """
-        Background startup task: find every WebPage record whose .md file no
-        longer exists on disk and silently re-crawl it using the stored URL.
-        """
-        with app.app_context():
-            all_pages = db_models.WebPage.query.filter(
-                db_models.WebPage.file_path.isnot(None),
-                db_models.WebPage.url.isnot(None),
-            ).all()
-
-            missing = [
-                p for p in all_pages
-                if not os.path.exists(os.path.join(storage_dir, p.file_path))
-            ]
-
+    def _task_restore_missing(ctx):
+        """Task: re-crawl any WebPage records whose .md file is missing on disk."""
+        all_pages = db_models.WebPage.query.filter(
+            db_models.WebPage.file_path.isnot(None),
+            db_models.WebPage.url.isnot(None),
+        ).all()
+        missing = [
+            p for p in all_pages
+            if not os.path.exists(os.path.join(storage_dir, p.file_path))
+        ]
         if not missing:
             return
-
-        print(f"[WebSearch] {len(missing)} .md file(s) missing — restoring in background…")
+        print(f"[WebSearch] {len(missing)} .md file(s) missing — restoring…")
         for i, page in enumerate(missing):
-            common_socket_events.show_search_status(
-                f"[WebSearch] Restoring missing page {i + 1}/{len(missing)}: {page.url}"
-            )
+            ctx.check()
+            ctx.update((i + 1) / len(missing),
+                       f'Restoring {i + 1}/{len(missing)}: {page.url}')
             try:
                 crawler.crawl_single_page(page.url, app=app)
             except Exception as exc:
                 print(f"[WebSearch] Could not restore {page.url}: {exc}")
-
-        common_socket_events.show_search_status("")
         print(f"[WebSearch] Restoration complete — {len(missing)} page(s) processed.")
 
     # ── Startup background tasks ─────────────────────────────────────────
-    threading.Thread(target=_restore_missing_md_files, daemon=True).start()
+    task_manager.submit('WebSearch: restore missing pages', _task_restore_missing)
     if os.path.exists(evaluator_path):
-        threading.Thread(target=_bulk_score_unscored, daemon=True).start()
+        _scoring_state['in_progress'] = True
+        task_manager.submit('WebSearch: score unscored pages', _task_score_pages)
 
     common_socket_events.show_loading_status('Web Search module ready!')
