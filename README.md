@@ -1,6 +1,6 @@
 # Web Search Module
 
-An Anagnorisis module for crawling, storing, and rating web pages — primarily IndieWeb, personal blogs and news websites. Allows the universal evaluator model to learn your web preferences from your ratings and automatically scores newly crawled pages so the best content rises to the top.
+An [Anagnorisis](https://github.com/volotat/Anagnorisis) module for crawling, storing, and rating web pages — primarily IndieWeb, personal blogs and news websites. Allows the universal evaluator model to learn your web preferences from your ratings and automatically scores newly crawled pages so the best content rises to the top.
 
 ## Installation
 
