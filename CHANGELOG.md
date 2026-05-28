@@ -1,6 +1,12 @@
 # Web Search Module - Changelog
 
-### Version 0.3.10.0 [for Anagnorisis > 0.3.10] (05.04.2026)
+### Version 0.4.1.5 [for Anagnorisis ≥ 0.4.1] (29.05.2026)
+*   **Background Rating Priority:**
+    *   The background scoring task now processes pages that have never been rated before re-scoring pages whose rating is simply outdated. Previously both groups were mixed, so a newly crawled page could wait behind a large re-rating queue. Now freshly crawled pages always get their first score as soon as possible.
+*   **Fixed missing `markitdown` dependency**
+    *   Added `markitdown` to `requirements.txt`; its absence caused the WebSearch module to fail on startup.
+
+### Version 0.3.10.4 [for Anagnorisis > 0.3.10] (05.04.2026)
 *   **Background Processing via Task Manager:**
     *   All long-running operations (add page, crawl site, bulk recrawl, single-folder recrawl, score unscored pages, restore missing Markdown files) are now submitted to the centralised `TaskManager` queue (`app.task_manager.submit()`) instead of being launched as bare `threading.Thread` daemon threads.
     *   Each task receives a `TaskContext` and calls `ctx.check()` / `ctx.update()` for cooperative pause, cancel, and live progress reporting.

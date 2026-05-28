@@ -1,2 +1,2 @@
-markitdown
 beautifulsoup4
+markitdown

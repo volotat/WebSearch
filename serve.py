@@ -28,7 +28,7 @@ from modules.WebSearch.crawler import (
 )
 from src.socket_events import CommonSocketEvents
 from src.text_embedder import TextEmbedder
-from modules.train.universal_train import UniversalEvaluator
+from src.universal_evaluator import UniversalEvaluator
 import src.file_manager as file_manager
 import rapidfuzz.fuzz
 from src.utils import weighted_shuffle
@@ -220,7 +220,7 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         common_socket_events=common_socket_events,
         media_directory=storage_dir,
         db_schema=db_models.WebPage,
-        update_model_ratings_func=_update_model_ratings,
+        # update_model_ratings_func=_update_model_ratings,
     )
 
     # ── Universal evaluator ──────────────────────────────────────────────
@@ -288,10 +288,16 @@ def init_socket_events(socketio: SocketIO, app: Flask = None, cfg=None, data_fol
         """Task: score all unscored / stale pages in the DB."""
         current_hash = evaluator.hash
         try:
-            pages = db_models.WebPage.query.filter(
-                (db_models.WebPage.model_rating.is_(None)) |
-                (db_models.WebPage.model_hash != current_hash)
+            # Unrated pages first, then stale-rated — so never-scored pages are
+            # always prioritised over re-scoring already-rated ones.
+            unrated = db_models.WebPage.query.filter(
+                db_models.WebPage.model_rating.is_(None)
             ).all()
+            stale = db_models.WebPage.query.filter(
+                db_models.WebPage.model_rating.isnot(None),
+                db_models.WebPage.model_hash != current_hash,
+            ).all()
+            pages = unrated + stale
             total = len(pages)
             if total == 0:
                 _scoring_state['last_hash'] = current_hash

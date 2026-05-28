@@ -5,7 +5,7 @@ An [Anagnorisis](https://github.com/volotat/Anagnorisis) module for crawling, st
 ## Installation
 
 Make sure you have the version of Anagnorisis no older than v0.3.7, which includes the external modules (i.e. extensions) support.
-Istall the module by simply going to the `modules/` directory of your Anagnorisis installation and clone the module repository there:
+Install the module by simply going to the `modules/` directory of your Anagnorisis installation and clone the module repository there:
 
 ```bash
 git clone https://github.com/volotat/WebSearch.git
